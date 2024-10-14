@@ -7,7 +7,7 @@ from models import VQ_VAE_Segment
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = VQ_VAE_Segment(state_dim=17, action_dim=6, latent_dim=32, num_embeddings=512).to(device)
-model.load_state_dict(torch.load('vqvae_model.pth')) 
+model.load_state_dict(torch.load('vq_vae.pth')) 
 model.eval()
 
 env = gym.make('halfcheetah-medium-replay-v2')
@@ -34,15 +34,26 @@ def segment_trajectory(traj, model):
         _, _, encoding_indices = model(traj)
     return encoding_indices.cpu().numpy()
 
-def plot_segmentation(encoding_indices, traj_num):
-    plt.figure(figsize=(10, 6))
-    plt.plot(encoding_indices.flatten(), label='Encoding Indices')
-    plt.title(f"Trajectory {traj_num} - Segmentation based on VQ-VAE Encoding Indices")
-    plt.xlabel("Timestep")
+import matplotlib.pyplot as plt
+
+def plot_segmentation_multiple(encoding_indices_list, num_trajectories):
+    plt.figure(figsize=(12, 8))
+    
+    cumulative_timestep = 0 
+    for traj_num, encoding_indices in enumerate(encoding_indices_list):
+        timesteps = range(cumulative_timestep, cumulative_timestep + len(encoding_indices))
+        plt.plot(timesteps, encoding_indices.flatten(), label=f'Sequence {traj_num + 1}')
+        cumulative_timestep += len(encoding_indices)
+    plt.title(f"Segmentation trajectories based on VQ-VAE Encoding Indices")
+    plt.xlabel("Cumulative Timestep")
     plt.ylabel("Encoding Index")
     plt.legend()
+    plt.tight_layout()
+    plt.savefig('segmentation_multiple_trajectories_shifted.png')
     plt.show()
 
-for traj_num, traj in enumerate(traj_data[:5]): 
+encoding_indices_list = []
+for traj_num, traj in enumerate(traj_data[:20]):  
     encoding_indices = segment_trajectory(traj, model)
-    plot_segmentation(encoding_indices, traj_num)
+    encoding_indices_list.append(encoding_indices)
+plot_segmentation_multiple(encoding_indices_list, num_trajectories=len(encoding_indices_list))
