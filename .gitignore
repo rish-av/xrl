@@ -1,2 +1,7 @@
 *.pth
 __pycache__/
+d4rl
+*mp4
+*png
+*sh
+wandb/
