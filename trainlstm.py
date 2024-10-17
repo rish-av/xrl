@@ -17,9 +17,9 @@ args = parser.parse_args()
 
 
 
-env = gym.make('halfcheetah-medium-replay-v2')
+env = gym.make('halfcheetah-medium-v2')
 dataset = env.get_dataset()
-num_items = 16000
+num_items = len( dataset['observations'])
 states = dataset['observations'][:num_items]
 actions = dataset['actions'][:num_items]
 next_states = dataset['next_observations'][:num_items]
@@ -31,7 +31,7 @@ hidden_dim = 128
 output_dim = states.shape[1]
 num_layers = 4
 seq_len = args.seq_len
-batch_size = 32 
+batch_size = 256 
 
 
 
@@ -57,7 +57,7 @@ def create_sequences(states, actions, seq_len, batch_size):
     seq_states = []
     seq_actions = []
     seq_next_states = []
-    for i in range(len(states) - seq_len):
+    for i in range(0, len(states) - seq_len, seq_len):
         seq_states.append(states[i:i+seq_len])
         seq_actions.append(actions[i:i+seq_len])
         seq_next_states.append(next_states[i+1:i+seq_len+1])
@@ -150,7 +150,7 @@ def sample_trajectories(states, actions, rewards, next_states, dones):
 
 model.apply(init_weights)
 batched_input, batched_output = create_sequences(states, actions, seq_len, batch_size)
-epochs = 10000
+epochs = 50
 save_interval = 100
 model_path = ''
 if os.path.exists(model_path):

@@ -6,3 +6,6 @@ d4rl
 *sh
 wandb/
 out/
+video*/
+visual*/
+weight*/

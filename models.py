@@ -104,3 +104,58 @@ class VQ_VAE_Segment(nn.Module):
         quantized, vq_loss, encoding_indices = self.vq_layer(latent)
         recon_traj = self.decoder(quantized)
         return recon_traj, vq_loss, encoding_indices
+    
+
+
+
+class VQEncoderM2O(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(VQEncoderM2O, self).__init__()
+        self.lstm = nn.LSTM(state_dim + action_dim, hidden_dim, batch_first=True)
+
+    def forward(self, traj):
+        out, (h_n, _) = self.lstm(traj) 
+        # h_n = h_n.squeeze(0) 
+        # print(h_n.shape, out[-1].shape)
+        return out[:, out.shape[1]-1, :]
+
+
+class VQDecoderO2M(nn.Module):
+    def __init__(self, latent_dim, state_dim, action_dim, hidden_dim=128):
+        super(VQDecoderO2M, self).__init__()
+        self.lstm = nn.LSTM(state_dim + action_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, state_dim + action_dim)
+        self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+
+    def forward(self, quantized_hn, seq_len):
+        batch_size = quantized_hn.size(0)
+        input_state = torch.zeros(batch_size, 1, self.state_dim + self.action_dim, device=quantized_hn.device)  
+
+        hidden_state = (quantized_hn.unsqueeze(0), torch.zeros(1, batch_size, self.hidden_dim, device=quantized_hn.device))
+        
+        outputs = []
+        for _ in range(seq_len):
+            lstm_out, hidden_state = self.lstm(input_state, hidden_state)
+            predicted_state = self.fc(lstm_out)
+            outputs.append(predicted_state)
+            input_state = predicted_state
+        outputs = torch.cat(outputs, dim=1)
+        
+        return outputs
+
+
+class VQ_Many2One(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim, latent_dim, num_embeddings):
+        super(VQ_Many2One, self).__init__()
+        self.encoder = VQEncoderM2O(state_dim, action_dim, hidden_dim)
+        self.vq_layer = VectorQuantizer(num_embeddings, latent_dim)
+        self.decoder = VQDecoderO2M(latent_dim, state_dim, action_dim, hidden_dim)
+
+    def forward(self, traj, seq_len):
+        latent_hn = self.encoder(traj)
+        quantized_hn, vq_loss, encoding_indices = self.vq_layer(latent_hn)
+        recon_traj = self.decoder(quantized_hn, seq_len)
+        
+        return recon_traj, vq_loss, encoding_indices
