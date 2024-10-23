@@ -11,9 +11,8 @@ from torch.utils.data import random_split
 learning_rate = 1e-3
 epochs = 500
 batch_size = 256
-seq_len = 25 
+seq_len = 16 
 step_size = 200  
-gamma = 0.5 
 
 state_dim = 17  
 action_dim = 6   
@@ -24,8 +23,6 @@ hidden_dim  = 128
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = VQ_Many2One(state_dim, action_dim, hidden_dim, latent_dim, num_embeddings).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-
 env = gym.make('halfcheetah-medium-v2')
 dataset = env.get_dataset()
 
@@ -66,10 +63,10 @@ for epoch in range(epochs):
         optimizer.step()
         epoch_loss += total_loss.item()
         batch_idx += 1
-    scheduler.step()
+    # scheduler.step()
 
     avg_train_loss = epoch_loss / batch_idx
-    print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
+    print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss:.4f}, LR: {learning_rate}')
     model.eval()
     with torch.no_grad():
         val_loss = 0
@@ -85,5 +82,5 @@ for epoch in range(epochs):
 
     model.train()
 
-torch.save(model.state_dict(), 'vq_m2o.pth')
+torch.save(model.state_dict(), 'vq_m2o_halfcheetah.pth')
 print("Training complete!")

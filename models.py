@@ -52,6 +52,23 @@ class VQEncoder(nn.Module):
         latent = self.fc(lstm_out)   
         return latent
 
+class VariationalEncoder(nn.Module):
+    def __init__(self, state_dim, action_dim, latent_dim, hidden_dim=128):
+        super(VariationalEncoder, self).__init__()
+        self.lstm = nn.LSTM(state_dim + action_dim, hidden_dim, batch_first=True)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+    
+    def forward(self, traj):
+        lstm_out, _ = self.lstm(traj)
+        mu = self.fc_mu(lstm_out)
+        logvar = self.fc_logvar(lstm_out)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std) 
+        z = mu + eps * std  
+        return z, mu, logvar
+
+
 class VectorQuantizer(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
         super(VectorQuantizer, self).__init__()
@@ -92,7 +109,26 @@ class VQDecoder(nn.Module):
         recon_traj = self.fc(lstm_out)
         return recon_traj
 
+
+
 class VQ_VAE_Segment(nn.Module):
+    def __init__(self, state_dim, action_dim, latent_dim, num_embeddings):
+        super(VQ_VAE_Segment, self).__init__()
+        self.encoder = VariationalEncoder(state_dim, action_dim, latent_dim)
+        self.vq_layer = VectorQuantizer(num_embeddings, latent_dim)
+        self.decoder = VQDecoder(latent_dim, state_dim, action_dim)
+
+    def forward(self, traj):
+        latent, mu, logvar = self.encoder(traj)
+        quantized, vq_loss, encoding_indices = self.vq_layer(latent)
+        recon_traj = self.decoder(quantized)
+        kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        total_loss = vq_loss + kl_divergence
+        return recon_traj, total_loss, encoding_indices
+
+
+
+class VQ_Segment(nn.Module):
     def __init__(self, state_dim, action_dim, latent_dim, num_embeddings):
         super(VQ_VAE_Segment, self).__init__()
         self.encoder = VQEncoder(state_dim, action_dim, latent_dim)

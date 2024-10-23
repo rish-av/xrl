@@ -3,14 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gym
 import d4rl
-from models import VQ_VAE_Segment
+from models import VQ_VAE_Segment, VQ_Many2One
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 import os
 import cv2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = VQ_VAE_Segment(state_dim=17, action_dim=6, latent_dim=32, num_embeddings=512).to(device)
+model = VQ_Many2One(state_dim=17, action_dim=6, hidden_dim=128, latent_dim=32, num_embeddings=512).to(device)
 model.load_state_dict(torch.load('vq_vae.pth')) 
 model.eval()
 
@@ -44,7 +44,7 @@ traj_data, render_data = create_trajectories(dataset, seq_len)
 def segment_trajectory(traj, model):
     with torch.no_grad():
         traj = traj.unsqueeze(0).to(device)  
-        _, _, encoding_indices = model(traj)
+        _, _, encoding_indices = model(traj, seq_len)
 
         encoding_indices = encoding_indices.cpu().numpy()
         codebook_vectors = model.vq_layer.embeddings.weight[encoding_indices]
@@ -52,8 +52,9 @@ def segment_trajectory(traj, model):
     return encoding_indices, codebook_vectors.cpu().numpy()
 
 codebook_means = []
-for traj_num, traj in enumerate(traj_data[:5000]):  
+for traj_num, traj in enumerate(traj_data[:20000]):  
     _, codebook_vecs = segment_trajectory(traj, model)
+    # print(codebook_vecs.shape)
     codebook_means.append(np.mean(codebook_vecs, axis=0))
 
 codebook_means_array = np.vstack(codebook_means)
@@ -72,13 +73,14 @@ for cluster_num in range(num_clusters):
     sorted_indices = cluster_indices[np.argsort(cluster_distances)]
     num_median = len(sorted_indices)//2
     ##this is for rendering
-    median_trajectories[cluster_num] = [render_data[i] for i in sorted_indices[num_median:num_median+3]]
+    median_trajectories[cluster_num] = [render_data[i] for i in sorted_indices[num_median:num_median+5]]
 
 pca = PCA(n_components=2)
 codebook_means_reduced = pca.fit_transform(codebook_means_array)
 centroids_reduced = pca.transform(centroids)
 plt.figure(figsize=(8, 6))
-colors = ['blue', 'green', 'orange', 'yellow', 'pink'] 
+colors = ['blue', 'green', 'orange', 'yellow', 'pink', 'purple', 'cyan', 'red', 'brown', 'black']
+
 for cluster_num in range(num_clusters):
     cluster_points = codebook_means_reduced[cluster_labels == cluster_num]
     plt.scatter(cluster_points[:, 0], cluster_points[:, 1], 
@@ -86,12 +88,12 @@ for cluster_num in range(num_clusters):
 plt.scatter(centroids_reduced[:, 0], centroids_reduced[:, 1], 
             c='red', marker='X', s=200, label='Centroids')
 
-plt.title("PCA on mean of codebook vectors")
+plt.title("PCA codebook vectors")
 plt.xlabel("PCA Component 1")
 plt.ylabel("PCA Component 2")
 plt.legend()
 plt.show()
-plt.savefig('check_codebook.png')
+plt.savefig('code_book_clusters.png')
 
 
 def save_video(frames, filename, fps=30):
@@ -116,10 +118,12 @@ for cluster_num, trajectories in median_trajectories.items():
             set_mujoco_state(env, qpos_t, qvel_t)
             frame = env.render(mode='rgb_array')
             frames.append(frame)
-        video_filename = f"video_vq/cluster_{cluster_num}_sequence_{i+1}.mp4"
+        
+        os.makedirs("video_vq_m2o", exist_ok=True)
+        video_filename = f"video_vq_m2o/cluster_{cluster_num}_sequence_{i+1}.mp4"
         save_video(frames, video_filename)
-        store = f"images/{cluster_num}/"
+        store = f"images_m2o/{cluster_num}/"
         
         os.makedirs(store, exist_ok=True)
         for j, frame in enumerate(frames):
-            cv2.imwrite(f"images/{cluster_num}/{j}.png", frame)
+            cv2.imwrite(f"images_m2o/{cluster_num}/{j}.png", frame)
