@@ -1,5 +1,10 @@
 import torch
 import torch.nn as nn
+import os
+
+
+
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 class TransformerEncoder(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim, num_heads, num_layers, max_len):
@@ -13,16 +18,20 @@ class TransformerEncoder(nn.Module):
             nhead=num_heads,
             num_encoder_layers=num_layers
         )
+        self.num_heads = num_heads
     
-    def generate_causal_mask(self, size):
-        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
-        return mask
+    def generate_causal_mask(self, batch_size, seq_len):
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(device)
+        causal_mask = mask.unsqueeze(0).expand(batch_size * self.num_heads, -1, -1)  # Shape: [batch_size * num_heads, seq_len, seq_len]
+        
+        return causal_mask
     
     def forward(self, states, actions):
+        batch_size, seq_len = states.size(0), states.size(1)
         state_emb = self.state_embedding(states)
         action_emb = self.action_embedding(actions)
-        embeddings = state_emb + action_emb + self.positional_encoding[:, :states.size(1), :]
-        causal_mask = self.generate_causal_mask(embeddings.size(1)).to(embeddings.device)
+        embeddings = state_emb + action_emb + self.positional_encoding[:, :seq_len, :]
+        causal_mask = self.generate_causal_mask(batch_size, seq_len)
         encoded_trajectory = self.transformer(embeddings, embeddings, src_mask=causal_mask)
         
         return encoded_trajectory
@@ -62,7 +71,7 @@ class VectorQuantizer(nn.Module):
 
 # Transformer Decoder
 class TransformerDecoder(nn.Module):
-    def __init__(self, hidden_dim, state_dim, action_dim, num_heads, num_layers, max_len):
+    def __init__(self, hidden_dim, state_dim, num_heads, num_layers):
         super(TransformerDecoder, self).__init__()
         self.transformer = nn.Transformer(
             d_model=hidden_dim,
@@ -70,16 +79,17 @@ class TransformerDecoder(nn.Module):
             num_encoder_layers=num_layers,
             num_decoder_layers=num_layers
         )
+        self.fc_target_embed = nn.Linear(state_dim, hidden_dim) ## 128->17
         self.fc_state = nn.Linear(hidden_dim, state_dim)
-        self.fc_action = nn.Linear(hidden_dim, action_dim)
     
-    def forward(self, quantized_embeddings, target_states, target_actions):
-        target_embeddings = self.fc_state(target_states) + self.fc_action(target_actions)
+    def forward(self, quantized_embeddings, target_states):
+
+
+        target_embeddings = self.fc_target_embed(target_states)
         decoded_output = self.transformer(quantized_embeddings, target_embeddings)
         predicted_states = self.fc_state(decoded_output)
-        predicted_actions = self.fc_action(decoded_output)
         
-        return predicted_states, predicted_actions
+        return predicted_states
 
 
 class TrajectoryTransformerVQ(nn.Module):
@@ -87,11 +97,11 @@ class TrajectoryTransformerVQ(nn.Module):
         super(TrajectoryTransformerVQ, self).__init__()
         self.encoder = TransformerEncoder(state_dim, action_dim, hidden_dim, num_heads, num_layers, max_len)
         self.quantizer = VectorQuantizer(num_embeddings, hidden_dim)
-        self.decoder = TransformerDecoder(hidden_dim, state_dim, action_dim, num_heads, num_layers, max_len)
+        self.decoder = TransformerDecoder(hidden_dim, state_dim, num_heads, num_layers)
     
-    def forward(self, states, actions, target_states=None, target_actions=None):
+    def forward(self, states, actions, target_states=None):
         encoded_trajectory = self.encoder(states, actions)
         quantized, quantization_loss, _ = self.quantizer(encoded_trajectory)
-        predicted_states, predicted_actions = self.decoder(quantized, target_states, target_actions)
+        predicted_states = self.decoder(quantized, target_states)
         
-        return predicted_states, predicted_actions, quantization_loss
+        return predicted_states, quantization_loss
