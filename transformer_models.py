@@ -11,7 +11,8 @@ class TransformerEncoder(nn.Module):
         super(TransformerEncoder, self).__init__()
         self.state_embedding = nn.Linear(state_dim, hidden_dim)
         self.action_embedding = nn.Linear(action_dim, hidden_dim)
-        self.positional_encoding = nn.Parameter(torch.zeros(1, max_len, hidden_dim))
+        self.eos_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.positional_encoding = nn.Parameter(torch.zeros(1, max_len + 1, hidden_dim))
         
         self.transformer = nn.Transformer(
             d_model=hidden_dim,
@@ -22,20 +23,22 @@ class TransformerEncoder(nn.Module):
     
     def generate_causal_mask(self, batch_size, seq_len):
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool().to(device)
-        causal_mask = mask.unsqueeze(0).expand(batch_size * self.num_heads, -1, -1)  # Shape: [batch_size * num_heads, seq_len, seq_len]
-        
+        causal_mask = mask.unsqueeze(0).expand(batch_size+1, -1, -1)
+        causal_mask = causal_mask.repeat(self.num_heads, 1, 1)
         return causal_mask
     
     def forward(self, states, actions):
         batch_size, seq_len = states.size(0), states.size(1)
         state_emb = self.state_embedding(states)
         action_emb = self.action_embedding(actions)
-        embeddings = state_emb + action_emb + self.positional_encoding[:, :seq_len, :]
+        embeddings = state_emb + action_emb
+        eos_token_expanded = self.eos_token.expand(batch_size, -1, -1)
+        embeddings = torch.cat([embeddings, eos_token_expanded], dim=1)
+        embeddings = embeddings + self.positional_encoding[:, :seq_len + 1, :]
         causal_mask = self.generate_causal_mask(batch_size, seq_len)
         encoded_trajectory = self.transformer(embeddings, embeddings, src_mask=causal_mask)
-        
-        return encoded_trajectory
-
+        eos_representation = encoded_trajectory[:, -1, :]
+        return eos_representation
 
 # Vector Quantizer Layer
 class VectorQuantizer(nn.Module):
@@ -79,14 +82,13 @@ class TransformerDecoder(nn.Module):
             num_encoder_layers=num_layers,
             num_decoder_layers=num_layers
         )
-        self.fc_target_embed = nn.Linear(state_dim, hidden_dim) ## 128->17
-        self.fc_state = nn.Linear(hidden_dim, state_dim)
+        self.fc_target_embed = nn.Linear(state_dim, hidden_dim)  # Project target states to hidden dim
+        self.fc_state = nn.Linear(hidden_dim, state_dim)  # Project hidden dim back to state dimension
     
-    def forward(self, quantized_embeddings, target_states):
-
-
+    def forward(self, quantized_eos_embedding, target_states):
         target_embeddings = self.fc_target_embed(target_states)
-        decoded_output = self.transformer(quantized_embeddings, target_embeddings)
+        # Use quantized EOS embedding as the encoder memory
+        decoded_output = self.transformer(quantized_eos_embedding.unsqueeze(0), target_embeddings)
         predicted_states = self.fc_state(decoded_output)
         
         return predicted_states
@@ -100,8 +102,8 @@ class TrajectoryTransformerVQ(nn.Module):
         self.decoder = TransformerDecoder(hidden_dim, state_dim, num_heads, num_layers)
     
     def forward(self, states, actions, target_states=None):
-        encoded_trajectory = self.encoder(states, actions)
-        quantized, quantization_loss, _ = self.quantizer(encoded_trajectory)
+        encoded_trajectory = self.encoder(states, actions)  # Encoded EOS token is the summary
+        quantized, quantization_loss, idxs = self.quantizer(encoded_trajectory)
         predicted_states = self.decoder(quantized, target_states)
         
         return predicted_states, quantization_loss
