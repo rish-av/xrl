@@ -49,6 +49,29 @@ class TransformerEncoder(nn.Module):
         return quantized[:, -1, :], vq_loss, encidx 
 
 
+
+class TransformerEncoderPerStates(nn.Module):
+    def __init__(self, input_dim, model_dim, num_heads, num_layers, num_embeddings):
+        super(TransformerEncoderPerStates, self).__init__()
+        self.embedding = nn.Linear(input_dim, model_dim)
+        self.positional_encoding = PositionalEncoding(model_dim)
+        self.eos_embedding = nn.Parameter(torch.randn(1, 1, model_dim))  # Learnable EOS embedding
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads),
+            num_layers=num_layers
+        )
+        self.vq_layer = EMAVectorQuantizer(num_embeddings, model_dim)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        x = self.embedding(x) + self.positional_encoding(seq_len)
+        eos_embedding_expanded = self.eos_embedding.expand(x.size(0), -1, -1)  # Match batch size
+        x = torch.cat([x, eos_embedding_expanded], dim=1)  # Append EOS token to each sequence
+        causal_mask = generate_causal_mask(x.size(1)).to(x.device)
+        x = self.transformer_encoder(x.permute(1, 0, 2), mask=causal_mask).permute(1, 0, 2)
+        quantized, vq_loss, encidx = self.vq_layer(x)
+        return quantized, vq_loss, encidx 
+
 class TransformerDecoder(nn.Module):
     def __init__(self, model_dim, output_dim, num_heads, num_layers):
         super(TransformerDecoder, self).__init__()
@@ -70,3 +93,36 @@ class TransformerDecoder(nn.Module):
         
         return self.fc_out(tgt.permute(1, 0, 2))
 
+class TransformerDecoderPerState(nn.Module):
+    def __init__(self, model_dim, output_dim, num_heads, num_layers):
+        super(TransformerDecoderPerState, self).__init__()
+        self.embedding = nn.Linear(output_dim, model_dim)
+        self.positional_encoding = PositionalEncoding(model_dim)
+        self.transformer_decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=model_dim, nhead=num_heads),
+            num_layers=num_layers
+        )
+        self.fc_out = nn.Linear(model_dim, output_dim)
+
+    def forward(self, tgt, memory):
+        seq_len = tgt.size(1)
+        tgt = self.embedding(tgt) + self.positional_encoding(seq_len)
+        
+        # Apply causal mask to decoder
+        causal_mask = generate_causal_mask(seq_len).to(tgt.device)
+        tgt = self.transformer_decoder(tgt.permute(1, 0, 2), memory.permute(1,0,2), tgt_mask=causal_mask)
+        
+        return self.fc_out(tgt.permute(1, 0, 2))
+
+    def generate_sequence(encoder, decoder, input_seq, max_length):
+        memory, vq_loss, _ = encoder(input_seq)
+        generated_seq = []
+        next_input = memory.unsqueeze(1)  # Start with the end-of-sequence embedding from the encoder
+
+        for _ in range(max_length):
+            output = decoder(next_input, memory.unsqueeze(0))  # Shape: (batch_size, 1, output_dim)
+            next_token = output[:, -1, :]  # Shape: (batch_size, output_dim)
+            generated_seq.append(next_token)
+            next_input = next_token.unsqueeze(1)  # Shape: (batch_size, 1, output_dim)
+        generated_seq = torch.cat(generated_seq, dim=1)  # Shape: (batch_size, max_length, output_dim)
+        return generated_seq, vq_loss

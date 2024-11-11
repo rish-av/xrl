@@ -3,18 +3,43 @@ import os
 import gym
 import numpy as np
 import cv2
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 import d4rl 
-import pandas as pd
 import argparse
-
 import torch
 import matplotlib.pyplot as plt
-import numpy as np
+import random
+import torch.nn.functional as F
+
+
+
+OBJECT_TO_IDX = {
+    'unseen'        : 0,
+    'empty'         : 1,
+    'wall'          : 2,
+    'floor'         : 3,
+    'door'          : 4,
+    'key'           : 5,
+    'ball'          : 6,
+    'box'           : 7,
+    'goal'          : 8,
+    'lava'          : 9,
+    'agent'         : 10,
+}
+
+COLOR_TO_IDX = {
+    'red'   : 0,
+    'green' : 1,
+    'blue'  : 2,
+    'purple': 3,
+    'yellow': 4,
+    'grey'  : 5
+}
+
 
 
 def get_args_mujoco():
@@ -37,10 +62,40 @@ def get_args_mujoco():
     parser.add_argument('--wandb_project', type=str, default='xrlwithbehaviors', help="Wandb project name")
     parser.add_argument('--wandb_run_name', type=str, default='xrlwithbehavior', help="Wandb run name")
     parser.add_argument('--wandb_entity', type=str, default='mail-rishav9', help="Wandb entity name")
+    parser.add_argument('--model_type', type=str, default='sequence', help="Model type: one id for each state or sequence")
 
 
     args = parser.parse_args()
     return args
+
+
+
+def get_args_minigrid():
+    parser = argparse.ArgumentParser(description="Transformer Model Parameters")
+    parser.add_argument('--env_name', type=str, default='minigrid-fourrooms-v0', help="Minigrid env name")
+    parser.add_argument('--model_dim', type=int, default=256, help="Transformer model dimension")
+    parser.add_argument('--num_heads', type=int, default=8, help="Number of attention heads")
+    parser.add_argument('--num_encoder_layers', type=int, default=4, help="Number of encoder layers")
+    parser.add_argument('--num_decoder_layers', type=int, default=4, help="Number of decoder layers")
+    parser.add_argument('--num_embeddings', type=int, default=64, help="VQ-VAE codebook size")
+    parser.add_argument('--batch_size', type=int, default=32, help="Batch size")
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help="Learning rate")
+    parser.add_argument('--num_epochs', type=int, default=50, help="Number of epochs")
+    parser.add_argument('--model_save_path', type=str, default='model_t.pth', help="Path to save the model")
+    parser.add_argument('--model_load_path', type=str, default='', help="Path to load the model")
+    parser.add_argument('--render', action='store_true')
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--log', action='store_true')
+    parser.add_argument('--wandb_project', type=str, default='xrlwithbehaviors', help="Wandb project name")
+    parser.add_argument('--wandb_run_name', type=str, default='xrlwithbehavior', help="Wandb run name")
+    parser.add_argument('--wandb_entity', type=str, default='mail-rishav9', help="Wandb entity name")
+    parser.add_argument('--model_type', type=str, default='sequence', help="Model type: one id for each state or sequence")
+
+
+    args = parser.parse_args()
+    return args
+
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Transformer Model Parameters")
@@ -59,6 +114,56 @@ def get_args():
 
     args = parser.parse_args()
     return args
+
+
+
+def split_into_trajectories(dataset, seq_len=5):
+    trajectories = []
+    current_traj = {'observations': [], 'actions': []}
+
+    for i in range(len(dataset['observations'])):
+        current_traj['observations'].append(dataset['observations'][i])
+        current_traj['actions'].append(dataset['actions'][i])
+        
+        # If 'done' is True, finalize the trajectory and start a new one
+        if dataset['terminals'][i] and len(current_traj['observations']) > seq_len:
+            trajectories.append({
+                'observations': np.array(current_traj['observations']),
+                'actions': np.array(current_traj['actions'])
+            })
+            current_traj = {'observations': [], 'actions': []}
+
+    return trajectories
+
+
+
+def one_hot_encode(actions, num_actions):
+    # Convert actions to one-hot encoded format
+    actions = actions.astype(int) 
+    return np.eye(num_actions)[actions]
+
+def extract_overlapping_segments_minigrid(dataset, segment_length, num_segments):
+    trajectories = split_into_trajectories(dataset, seq_len=segment_length)
+    
+    segments = []
+    for trajectory in trajectories:
+        observations = [obs.flatten() for obs in trajectory['observations']]
+        actions = one_hot_encode(trajectory['actions'], len(np.unique(dataset['actions']))) 
+        traj_segments = []
+
+        # Calculate segments for the current trajectory
+        max_index = min(len(observations) - segment_length + 1, num_segments)
+        for i in range(max_index):
+            obs_segment = observations[i:i + segment_length]
+            act_segment = actions[i:i + segment_length]
+            segment = np.concatenate((obs_segment, act_segment), axis=-1)
+            traj_segments.append(segment)
+        
+        segments.append(traj_segments)  # Append list of segments for this trajectory
+
+    return segments
+
+
 
 def extract_overlapping_segments(d4rl_dataset, segment_length, num_segments):
     observations = d4rl_dataset['observations']
@@ -92,6 +197,38 @@ def generate_causal_mask(size):
     mask = mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
     return mask
 
+
+
+
+def plot_distances_minigrid(segments, encoder):
+
+    with torch.no_grad():
+        encoder.eval()
+        distances = []
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        for i in range(len(segments) - 1):
+            quantized, _, encoding_indices = encoder(torch.tensor(segments[i]).to(device).unsqueeze(0).float())
+            quantized1, _, encoding_indices1 = encoder(torch.tensor(segments[i + 1]).to(device).unsqueeze(0).float())
+
+            codebook_vector = encoder.vq_layer.embedding[encoding_indices.view(-1)]
+            codebook_vector1 = encoder.vq_layer.embedding[encoding_indices1.view(-1)]
+
+            distance = torch.norm(codebook_vector - codebook_vector1).mean().item()
+            distances.append(distance)
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(distances)), distances, marker='o', label='Distances')
+        plt.xlabel('Segment Index')
+        plt.ylabel('Average Distance Between Consecutive Codebook Vectors')
+        plt.title('Distance Between Codebook Vectors of Consecutive Segments')
+        plt.legend()
+        plt.show()
+        plt.savefig('distance_from_prevcodebook_minigrid.png')
+
+
+
+
 def plot_distances(segments, encoder, quantizer):
     with torch.no_grad():
         encoder.eval()
@@ -113,16 +250,16 @@ def plot_distances(segments, encoder, quantizer):
             distances.append(distance)
 
         # Find extreme points based on deviation from the mean or local maxima
-        mean_distance = np.mean(distances)
-        std_distance = np.std(distances)
-        threshold = mean_distance + 1.5 * std_distance  # Points significantly above mean + threshold are considered extremes
+        # mean_distance = np.mean(distances)
+        # std_distance = np.std(distances)
+        # threshold = mean_distance + 1.5 * std_distance  # Points significantly above mean + threshold are considered extremes
 
-        extreme_points = [i for i, dist in enumerate(distances) if dist > threshold]
+        # extreme_points = [i for i, dist in enumerate(distances) if dist > threshold]
 
         # Plotting the distances with extreme points highlighted
         plt.figure(figsize=(10, 5))
         plt.plot(range(len(distances)), distances, marker='o', label='Distances')
-        plt.scatter(extreme_points, [distances[i] for i in extreme_points], color='red', label='Extreme Points')
+        # plt.scatter(extreme_points, [distances[i] for i in extreme_points], color='red', label='Extreme Points')
         plt.xlabel('Segment Index')
         plt.ylabel('Average Distance Between Consecutive Codebook Vectors')
         plt.title('Distance Between Codebook Vectors of Consecutive Segments')
@@ -145,7 +282,7 @@ def cluster_codebook_vectors(codebook_embeddings, num_clusters=10, random_state=
     return clusters, kmeans, centers
 
 
-def visualize_codebook_clusters(codebook_embeddings, clusters, cluster_centers, method='pca'):
+def visualize_codebook_clusters(codebook_embeddings, clusters, cluster_centers, env_name, method='pca'):
     if isinstance(codebook_embeddings, torch.Tensor):
         codebook_embeddings = codebook_embeddings.detach().cpu().numpy()
     if method == 'pca':
@@ -176,7 +313,7 @@ def visualize_codebook_clusters(codebook_embeddings, clusters, cluster_centers, 
     plt.ylabel('Component 2')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'codebookcluster_{method}.png')
+    plt.savefig(f'codebookcluster_{env_name}_{method}.png')
     plt.show()
 
 
@@ -207,6 +344,61 @@ class D4RLDatasetMujoco(Dataset):
         state_action_seq = torch.cat((torch.tensor(state_seq), torch.tensor(action_seq)), dim=-1)
         return state_action_seq, torch.tensor(next_state_seq)
 
+
+class FlatObsWrapper:
+    def __init__(self, env):
+        self.env = env
+
+    def flatten_obs(self, obs):
+        full_grid = self.env.grid.encode()
+        full_grid[self.env.agent_pos[0]][self.env.agent_pos[1]] = np.array([
+            OBJECT_TO_IDX['agent'],
+            COLOR_TO_IDX['red'],
+            self.env.agent_dir
+        ])
+        full_grid = full_grid[1:-1, 1:-1]  # remove outer walls
+        return full_grid.ravel()
+
+
+
+class D4RLMinigrid(Dataset):
+    def __init__(self, states, actions, dones, seq_len=5, num_actions=6, env=None):
+        self.states = [state.flatten() for state in states]
+        self.actions = actions
+        self.dones = dones
+        self.num_actions = num_actions 
+        self.seq_len = seq_len
+        self.episodes = self.create_episodes(self.states, actions, dones)
+        
+
+    def create_episodes(self, states, actions, dones):
+        episodes = []
+        episode = {'states': [], 'actions': []}
+        for i in range(len(states)):
+            episode['states'].append(states[i])
+            # Convert each action to a one-hot vector
+            one_hot_action = F.one_hot(torch.tensor(int(actions[i])), num_classes=self.num_actions).float()
+            episode['actions'].append(one_hot_action)
+            if dones[i]:
+                if len(episode['states']) > self.seq_len:
+                    episodes.append(episode)
+                episode = {'states': [], 'actions': []}
+        if episode['states'] and len(episode['states']) > self.seq_len:
+            episodes.append(episode)
+        return episodes
+
+    def __len__(self):
+        return sum(len(ep['states']) - 1 for ep in self.episodes)
+
+    def __getitem__(self, idx):
+        episode = random.choice(self.episodes)
+        episode_length = len(episode['states'])
+        start_idx = random.randint(0, episode_length - self.seq_len - 1)
+        state_seq = episode['states'][start_idx:start_idx + self.seq_len]
+        action_seq = episode['actions'][start_idx:start_idx + self.seq_len]
+        next_state_seq = episode['states'][start_idx + 1:start_idx + self.seq_len + 1]
+        state_action_seq = torch.cat((torch.tensor(state_seq), torch.stack(action_seq)), dim=-1)
+        return state_action_seq, torch.tensor(next_state_seq)
 
 
 def render_videos_for_behavior_codes_opencv(model, num_videos=5, segment_length=10, env_name="halfcheetah-medium-v2", output_dir="behavior_videos4"):
