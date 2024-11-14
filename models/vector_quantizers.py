@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from sklearn.cluster import KMeans
 
 class EMAVectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, decay=0.99, epsilon=1e-5, commitment_cost=0.25):
+    def __init__(self, num_embeddings, embedding_dim, decay=0.99, epsilon=1e-5, commitment_cost=1.0):
         super(EMAVectorQuantizer, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -13,6 +13,7 @@ class EMAVectorQuantizer(nn.Module):
         self.commitment_cost = commitment_cost
 
         # Codebook for vector quantization
+        print(f"Initializing codebook with {num_embeddings} embeddings of size {embedding_dim}.")
         self.embedding = nn.Parameter(torch.randn(num_embeddings, embedding_dim))
         self.cluster_size = nn.Parameter(torch.zeros(num_embeddings), requires_grad=False)
         self.ema_w = nn.Parameter(self.embedding.clone(), requires_grad=False)

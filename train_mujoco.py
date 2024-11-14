@@ -4,7 +4,7 @@ import d4rl
 import gym
 import torch.nn as nn
 import torch
-from utils import D4RLDatasetMujoco
+from utils import D4RLDatasetMujoco, extract_overlapping_segments, plot_distances_minigrid, plot_distances_from_center, extract_non_overlapping_segments, cluster_codebook_vectors, visualize_codebook_clusters
 import wandb
 
 
@@ -36,18 +36,18 @@ else:
 
 if args.log:
     #run name as-> env_name + "_" + DD-HH-MM
-    wandb_run_name = env_name + "_" + model_type + "_" + wandb.util.generate_id()
+    wandb_run_name = env_name + "_one_idx_" + model_type + "_" + wandb.util.generate_id()
 
     #add config to wandb
     wandb.init(project=wandb_project, name=wandb_run_name, entity=wandb_entity, config=args)
 
 
 env = gym.make(env_name)
-dataset = env.get_dataset()
+dataset_org = env.get_dataset()
 num_samples = 100000
-states = dataset['observations'][:num_samples]
-actions = dataset['actions'][:num_samples]
-next_states = dataset['next_observations'][:num_samples]
+states = dataset_org['observations'][:num_samples]
+actions = dataset_org['actions'][:num_samples]
+next_states = dataset_org['next_observations'][:num_samples]
 
 input_dim = states.shape[1] + actions.shape[1] 
 output_dim = states.shape[1]      
@@ -60,11 +60,24 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 dataset = D4RLDatasetMujoco(states, actions, next_states, sequence_length=25)
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+
+
+model.eval()
+if model_load_path!='':
+    model.load_state_dict(torch.load(model_load_path))
+
+
+
+clusters, kmeans, centers = cluster_codebook_vectors(model.encoder.vq_layer.embedding, 10)
+visualize_codebook_clusters(model.encoder.vq_layer.embedding, clusters, centers, env_name)
+
+
+# from utils import plot_distance_state
+segments = extract_overlapping_segments(dataset_org, 25, 100)
+plot_distances_minigrid(segments, model.encoder, 'distance_overlapping.png')
+
 if args.train:
     model.train()
-    if model_load_path!='':
-        model.load_state_dict(torch.load(model_load_path))
-
     for epoch in range(num_epochs):
         epoch_loss = 0
         for src, tgt in dataloader:
@@ -73,19 +86,21 @@ if args.train:
             # Prepare inputs and targets
             src = src.to(device)
 
-            tgt_input = tgt[:, :-1, :].to(device)  # Use all but last next state as target input for the decoder
-            tgt_output = tgt[:, 1:, :].to(device)  # Shifted target sequence to predict next state
+            tgt_input = tgt[:, :-1, :].to(device)  # Use all but last next state as target input for the decoder (s0,s1,...,sT-1)
+            tgt_output = tgt[:, 1:, :].to(device)  # Shifted target sequence to predict next state (s1,s2,...,sT)
             
             # Forward pass
             output, vq_loss, encidx = model(src, tgt_input)
-
-            print(encidx.shape)
             
             # Compute loss
             loss = criterion(output, tgt_output) + vq_loss
+
+            # Backward pass
             loss.backward()
             optimizer.step()
             
+            print(f"loss: {loss.item()}, vq_loss: {vq_loss.item()}, num_unique_ids: {len(torch.unique(encidx))}")
+
             epoch_loss += loss.item()
 
             if args.log:

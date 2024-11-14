@@ -14,7 +14,8 @@ import torch
 import matplotlib.pyplot as plt
 import random
 import torch.nn.functional as F
-
+import d4rl_atari
+import gzip
 
 
 OBJECT_TO_IDX = {
@@ -39,6 +40,45 @@ COLOR_TO_IDX = {
     'yellow': 4,
     'grey'  : 5
 }
+
+
+import argparse
+
+def get_args_atari():
+    parser = argparse.ArgumentParser(description="Arguments for Atari D4RL Transformer Model")
+    
+    # Environment and Dataset
+    parser.add_argument('--env_name', type=str, default='seaquest-medium-v2', help='Name of the Atari environment')
+    
+    # Model Parameters
+    parser.add_argument('--model_dim', type=int, default=256, help='Dimensionality of model embeddings')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads in the Transformer')
+    parser.add_argument('--num_encoder_layers', type=int, default=4, help='Number of layers in the Transformer encoder')
+    parser.add_argument('--num_decoder_layers', type=int, default=4, help='Number of layers in the Transformer decoder')
+    parser.add_argument('--num_embeddings', type=int, default=128, help='Number of embeddings for the VQ layer')
+
+    # Training Parameters
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
+    
+    # Checkpoints
+    parser.add_argument('--model_save_path', type=str, default='bexrl_atari_model.pth', help='Path to save the trained model')
+    parser.add_argument('--model_load_path', type=str, default='', help='Path to load a pre-trained model (leave empty if not loading)')
+
+    # WandB Logging
+    parser.add_argument('--log', action='store_true', help='Enable logging to Weights & Biases')
+    parser.add_argument('--wandb_project', type=str, default='xrlwithbehaviors', help="Wandb project name")
+    parser.add_argument('--wandb_run_name', type=str, default='xrlwithbehavior', help="Wandb run name")
+    parser.add_argument('--wandb_entity', type=str, default='mail-rishav9', help="Wandb entity name")
+
+    # Miscellaneous
+    parser.add_argument('--train', action='store_true', help='Set this flag to train the model')
+    parser.add_argument('--model_type', type=str, choices=['sequence', 'state'], default='sequence', help='Model type: sequence or state')
+    
+    args = parser.parse_args()
+    return args
+
 
 
 
@@ -199,8 +239,71 @@ def generate_causal_mask(size):
 
 
 
+def plot_distances_from_center(segments, encoder, name='distance_from_center_minigrid.png', env_name='halfcheetah-medium-v2'):
+    with torch.no_grad():
+        encoder.eval()
+        distances = []
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def plot_distances_minigrid(segments, encoder):
+        # Calculate the center of the codebook vectors
+        codebook_vectors = encoder.vq_layer.embedding
+        center_vector = codebook_vectors.mean(dim=0)
+
+        for i in range(len(segments)):
+            quantized, _, encoding_indices = encoder(torch.tensor(segments[i]).to(device).unsqueeze(0).float())
+            codebook_vector = encoder.vq_layer.embedding[encoding_indices.view(-1)]
+
+            # Compute distance from the center
+            distance = torch.norm(codebook_vector - center_vector).mean().item()
+            distances.append(distance)
+
+            render_segment(segments[i], env_name, f'segment_viz/segment_{i}.mp4') # Render the segment
+        
+        # Plotting
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(distances)), distances, marker='o', label='Distance from Center')
+
+        for idx, distance in enumerate(distances):
+            plt.text(idx, distance, f'{idx}', ha='right', va='bottom')
+        plt.xlabel('Segment Index')
+        plt.ylabel('Average Distance from Center of Codebook Vector')
+        plt.title('Distance from Center of Codebook Vector for Each Segment')
+        plt.legend()
+        plt.show()
+        plt.savefig(name)
+
+
+
+def plot_distance_state(segment, encoder, name='distance_prev_state.png', env_name='halfcheetah-medium-v2'):
+
+    with torch.no_grad():
+        encoder.eval()
+        distances = []
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+        all_vecs = []
+        for i in range(len(segment)):
+            q, _, encoding_indices = encoder(torch.tensor(segment[i]).to(device).unsqueeze(0).float())
+            codebook_vectors = encoder.vq_layer.embedding[encoding_indices.view(-1)]
+            all_vecs.append(codebook_vectors)
+        all_vecs = torch.cat(all_vecs, dim=0)
+        print(all_vecs.shape)
+        for i in range(all_vecs.shape[0] - 1):
+            distance = torch.norm(all_vecs[i] - all_vecs[i + 1]).mean().item()
+            distances.append(distance)
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(len(distances)), distances, marker='o', label='Distances')
+        plt.xlabel('State Index')
+        plt.ylabel('Average Distance Between Consecutive Codebook Vectors')
+        plt.title('Distance Between Codebook Vectors of Consecutive States')
+        plt.legend()
+        plt.show()
+        plt.savefig(name)
+
+
+def plot_distances_minigrid(segments, encoder, name='distance_from_prevcodebook_minigrid.png', env_name='halfcheetah-medium-v2'):
 
     with torch.no_grad():
         encoder.eval()
@@ -216,6 +319,11 @@ def plot_distances_minigrid(segments, encoder):
 
             distance = torch.norm(codebook_vector - codebook_vector1).mean().item()
             distances.append(distance)
+
+
+            if distance > 0.5:
+                render_segment(segments[i], env_name, f'seq_adj/segment_{i}.mp4') # Render the segment
+                render_segment(segments[i+1], env_name, f'seq_adj/segment_{i+1}.mp4')
         
         plt.figure(figsize=(10, 5))
         plt.plot(range(len(distances)), distances, marker='o', label='Distances')
@@ -224,7 +332,7 @@ def plot_distances_minigrid(segments, encoder):
         plt.title('Distance Between Codebook Vectors of Consecutive Segments')
         plt.legend()
         plt.show()
-        plt.savefig('distance_from_prevcodebook_minigrid.png')
+        plt.savefig(name)
 
 
 
@@ -361,7 +469,7 @@ class FlatObsWrapper:
 
 
 
-class D4RLMinigrid(Dataset):
+class D4RLDiscrete(Dataset):
     def __init__(self, states, actions, dones, seq_len=5, num_actions=6, env=None):
         self.states = [state.flatten() for state in states]
         self.actions = actions
@@ -399,6 +507,96 @@ class D4RLMinigrid(Dataset):
         next_state_seq = episode['states'][start_idx + 1:start_idx + self.seq_len + 1]
         state_action_seq = torch.cat((torch.tensor(state_seq), torch.stack(action_seq)), dim=-1)
         return state_action_seq, torch.tensor(next_state_seq)
+
+
+
+class D4RLAtariBeXRL(Dataset):
+    def __init__(self, states, actions, dones, seq_len=5, num_actions=6, env=None):
+        self.states = states  # Each state remains in its original frame shape [channels, height, width]
+        self.actions = actions
+        self.dones = dones
+        self.num_actions = np.max(actions) + 1
+        self.seq_len = seq_len
+        self.episodes = self.create_episodes(states, actions, dones)
+
+    def create_episodes(self, states, actions, dones):
+        """
+        Organizes the data into episodes based on `dones` signals, ensuring each episode has a minimum length.
+        """
+        episodes = []
+        episode = {'states': [], 'actions': []}
+        
+        for i in range(len(states)):
+            episode['states'].append(states[i])
+            
+            # Convert each action to a one-hot vector
+            # one_hot_action = F.one_hot(torch.tensor(int(actions[i])), num_classes=self.num_actions).float()
+            episode['actions'].append(actions[i])
+            
+            if dones[i]:  # End of episode
+                if len(episode['states']) > self.seq_len:  # Only keep if episode is longer than seq_len
+                    episodes.append(episode)
+                episode = {'states': [], 'actions': []}
+        
+        # Add the last episode if it wasn't added due to lack of a terminal signal
+        if episode['states'] and len(episode['states']) > self.seq_len:
+            episodes.append(episode)
+        
+        return episodes
+
+    def __len__(self):
+        return sum(len(ep['states']) - 1 for ep in self.episodes)
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a sequence of states and actions for a randomly chosen episode.
+        """
+        episode = random.choice(self.episodes)
+        episode_length = len(episode['states'])
+        
+        # Randomly choose a starting index such that a full sequence can be obtained
+        start_idx = random.randint(0, episode_length - self.seq_len - 1)
+        
+        # Get sequences of states and actions
+        state_seq = episode['states'][start_idx:start_idx + self.seq_len]
+        action_seq = episode['actions'][start_idx:start_idx + self.seq_len]
+        next_state_seq = episode['states'][start_idx + 1:start_idx + self.seq_len + 1]
+
+        # Stack states and actions into tensors separately
+        state_seq = torch.stack([torch.tensor(state) for state in state_seq])  # Shape: [seq_len, channels, height, width]
+        next_state_seq = torch.stack([torch.tensor(state) for state in next_state_seq])  # Shape: [seq_len, channels, height, width]
+        # Return states, actions, and next states separately
+        return state_seq, torch.tensor(action_seq), next_state_seq
+
+
+
+def render_segment(segment, env_name="halfcheetah-medium-v2", output_path="segment_video.mp4"):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    env = gym.make(env_name)
+    env.reset()
+    video_frames = []
+    
+    # Replay the segment in the environment
+    for state_action in segment:
+        state = state_action[:env.observation_space.shape[0]]
+        action = state_action[env.observation_space.shape[0]:]
+        
+        # Render the environment using the given state
+        frame = render_halfcheetah(env, state)
+        video_frames.append(frame)
+
+    # Prepare the VideoWriter to save the video
+    height, width, _ = video_frames[0].shape
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+
+    for frame in video_frames:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
+        out.write(frame_bgr)
+        
+    out.release()
+    env.close()
+    print(f"Segment video saved as {output_path}")
+
 
 
 def render_videos_for_behavior_codes_opencv(model, num_videos=5, segment_length=10, env_name="halfcheetah-medium-v2", output_dir="behavior_videos4"):
@@ -451,7 +649,7 @@ def render_videos_for_behavior_codes_opencv(model, num_videos=5, segment_length=
             # Prepare the VideoWriter
             height, width, _ = video_frames[0].shape
             video_path = os.path.join(output_dir, f"behavior_{behavior_code}_video_{i + 1}.mp4")
-            out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'XVID'), 10, (width, height))
+            out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
             
             for frame in video_frames:
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -461,3 +659,97 @@ def render_videos_for_behavior_codes_opencv(model, num_videos=5, segment_length=
 
     env.close()
     print("Rendering complete.")
+
+
+def _stack(observations, terminals, n_channels=4):
+    rets = []
+    t = 1
+    for i in range(observations.shape[0]):
+        if t < n_channels:
+            padding_shape = (n_channels - t, ) + observations.shape[1:]
+            padding = np.zeros(padding_shape, dtype=np.uint8)
+            observation = observations[i - t + 1:i + 1]
+            observation = np.vstack([padding, observation])
+        else:
+            # avoid copying data
+            observation = observations[i - n_channels + 1:i + 1]
+
+        rets.append(observation)
+
+        if terminals[i]:
+            t = 1
+        else:
+            t += 1
+    return rets
+
+
+def _load(name, dir_path):
+    path = os.path.join(dir_path, name + '.gz')
+    with gzip.open(path, 'rb') as f:
+        print('loading {}...'.format(path))
+        return np.load(f, allow_pickle=False)
+
+class OfflineEnvAtari:
+
+    def __init__(self,
+                 game=None,
+                 index=None,
+                 start_epoch= 0,
+                 last_epoch= 1,
+                 stack=False,
+                 path='./datasets'):
+        self.game = game
+        self.index = index
+        self.start_epoch = start_epoch
+        self.last_epoch = last_epoch
+        self.stack = stack
+        self.path = path
+
+    def get_dataset(self):
+        observation_stack = []
+        action_stack = []
+        reward_stack = []
+        terminal_stack = []
+        for epoch in range(self.start_epoch, self.last_epoch):
+
+            observations = _load('observation', self.path)
+            actions = _load('action', self.path)
+            rewards = _load('reward', self.path)
+            terminals = _load('terminal', self.path)
+
+            # sanity check
+            assert observations.shape == (1000000, 84, 84)
+            assert actions.shape == (1000000, )
+            assert rewards.shape == (1000000, )
+            assert terminals.shape == (1000000, )
+
+            observation_stack.append(observations)
+            action_stack.append(actions)
+            reward_stack.append(rewards)
+            terminal_stack.append(terminals)
+
+        if len(observation_stack) > 1:
+            observations = np.vstack(observation_stack)
+            actions = np.vstack(action_stack).reshape(-1)
+            rewards = np.vstack(reward_stack).reshape(-1)
+            terminals = np.vstack(terminal_stack).reshape(-1)
+        else:
+            observations = observation_stack[0]
+            actions = action_stack[0]
+            rewards = reward_stack[0]
+            terminals = terminal_stack[0]
+
+        # memory-efficient stacking
+        if self.stack:
+            observations = _stack(observations, terminals)
+        else:
+            observations = observations.reshape(-1, 1, 84, 84)
+
+        data_dict = {
+            'observations': observations,
+            'actions': actions,
+            'rewards': rewards,
+            'terminals': terminals
+        }
+
+        return data_dict
