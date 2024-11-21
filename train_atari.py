@@ -8,6 +8,18 @@ from utils import OfflineEnvAtari
 import random
 import math
 import numpy as np
+from models.vector_quantizers import EMAVectorQuantizer
+import cv2
+from utils import get_args_atari
+
+
+args = get_args_atari()
+
+if args.log:
+    import wandb
+    print("Logging to wandb")
+    wandb.init(project=args.wandb_project, name=args.wandb_run_name, entity=args.wandb_entity, config=args)
+    wandb.config.update(args)
 
 
 class AtariSequenceDataset(Dataset):
@@ -149,6 +161,8 @@ class Seq2SeqTransformer(nn.Module):
         
         # Positional Encoding
         self.positional_encoding = PositionalEncoding(embed_dim)
+
+        self.vqae = EMAVectorQuantizer(128, embed_dim, commitment_cost=1.0)
         
         # Image encoder to convert images to embeddings
         self.image_encoder = nn.Sequential(
@@ -166,11 +180,11 @@ class Seq2SeqTransformer(nn.Module):
         self.action_embedding = nn.Embedding(action_dim, embed_dim)
 
         # Transformer Encoder for (state, action) pairs
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=dim_feedforward)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=dim_feedforward, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
         # Transformer Decoder for future states
-        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=dim_feedforward)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=n_heads, dim_feedforward=dim_feedforward, batch_first=True)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         # Transpose Conv layers to decode embeddings back into images
@@ -191,69 +205,127 @@ class Seq2SeqTransformer(nn.Module):
         return mask
 
     def forward(self, states, actions, tgt_states):
-        seq_len, batch_size = states.size(0), states.size(1)
+        batch_size, seq_len, C, H, W = states.size()
         
         # Generate causal masks for encoder and decoder
         encoder_mask = self.generate_square_subsequent_mask(seq_len).to(states.device)
-        decoder_mask = self.generate_square_subsequent_mask(seq_len-1).to(states.device)
+        decoder_mask = self.generate_square_subsequent_mask(seq_len).to(states.device)
         
         # Encode the input states
-        encoded_states = torch.stack([self.image_encoder(s) for s in states], dim=0)  # [seq_len, batch_size, embed_dim]
+        encoded_states = torch.stack([self.image_encoder(states[:, i]) for i in range(seq_len)], dim=1)  # [batch_size, seq_len, embed_dim]
         
         # Embed actions and combine with states
-        encoded_actions = self.action_embedding(actions)  # [seq_len, batch_size, embed_dim]
+        encoded_actions = self.action_embedding(actions)  # [batch_size, seq_len, embed_dim]
         encoder_input = encoded_states + encoded_actions
         
         # Add positional encoding to encoder input
         encoder_input = self.positional_encoding(encoder_input)
         
         # Transformer Encoder with mask for causality
-        eos_rep = self.encoder(encoder_input, mask=encoder_mask)  # [seq_len, batch_size, embed_dim]
-        eos_rep = eos_rep[-1]  # End of sequence representation for the decoder
+        eos_rep = self.encoder(encoder_input, mask=encoder_mask)  # [batch_size, seq_len, embed_dim]
+        eos_rep = eos_rep[:, -1, :]  # End of sequence representation for the decoder
         
-        # Prepare the target sequence embeddings for the decoder
-        tgt_input = tgt_states[:-1,:,:,:,:] # Remove the last state from the target sequence for teacher forcing
-        tgt_encoded_states = torch.stack([self.image_encoder(s) for s in tgt_input], dim=0)  # [seq_len, batch_size, embed_dim]
+        # Quantize representation
+        eos_rep, vq_loss, encoding_indices = self.vqae(eos_rep)
+        
+        # Prepare the target sequence embeddings for the decoder with teacher forcing
+        # Shift the target states by one position to the right
+        tgt_input = torch.zeros_like(tgt_states)  # Initialize with zeros for the <START> token
+        tgt_input[:, 1:] = tgt_states[:, :-1]  # Shifted target states
+        
+        # Encode the shifted target states
+        tgt_encoded_states = torch.stack([self.image_encoder(tgt_input[:, i]) for i in range(seq_len)], dim=1)  # [batch_size, seq_len, embed_dim]
         
         # Add positional encoding to target states
         tgt_encoded_states = self.positional_encoding(tgt_encoded_states)
         
         # Transformer Decoder with causal mask
-        decoder_output = self.decoder(tgt_encoded_states, eos_rep.unsqueeze(0), tgt_mask=decoder_mask)  # [seq_len, batch_size, embed_dim]
+        decoder_output = self.decoder(tgt_encoded_states, eos_rep.unsqueeze(1), tgt_mask=decoder_mask)  # [batch_size, seq_len, embed_dim]
         
         # Reconstruct images from the transformer decoder output
-        reconstructed_states = torch.stack([self.reconstruction_decoder(dec) for dec in decoder_output], dim=0)
+        reconstructed_states = torch.stack([self.reconstruction_decoder(decoder_output[:, i]) for i in range(seq_len)], dim=1)
         
-        return reconstructed_states  # Shape: [seq_len, batch_size, 3, image_size, image_size]
+        return reconstructed_states, vq_loss, encoding_indices  
+
 
 # Define the loss function for image reconstruction
 def reconstruction_loss(reconstructed_states, target_states):
     return nn.MSELoss()(reconstructed_states, target_states)
 
+def recover_image(image):
+    # Shift the values from [-0.5, 0.5] to [0, 1]
+    image_normalized = image + 0.5  # Shift the range to [0, 1]
+    # Scale to the range [0, 255]
+    image_scaled = np.clip(image_normalized * 255, 0, 255).astype(np.uint8)  # Scale to [0, 255]
+    return image_scaled
+
+
 # Example training loop
+import torch.nn.functional as F
+
 def train_model(model, dataloader, optimizer, num_epochs):
     model.train()
     for epoch in range(num_epochs):
         total_loss = 0
         for states, actions, target_states in dataloader:
-            states, actions, target_states = states.permute(1,0,2,3,4).to('cuda'), actions.permute(1,0).to('cuda'), target_states.to('cuda').permute(1,0,2,3,4)
+            # Move data to GPU
+            states, actions, target_states = (
+                states.to('cuda').float(),
+                actions.to('cuda'),
+                target_states.to('cuda').float(),
+            )
+            top_crop = 18  # Pixels to crop from the top
+            bottom_crop = 20  # Pixels to crop from the bottom
+            states = states[:, :, :, top_crop:-bottom_crop, :]
+            target_states = target_states[:, :, :, top_crop:-bottom_crop, :]
+            
+            states = F.interpolate(states.view(-1, *states.shape[2:]), size=(84, 84), mode='bilinear').view(*states.shape[:2], -1, 84, 84)
+            target_states = F.interpolate(target_states.view(-1, *target_states.shape[2:]), size=(84, 84), mode='bilinear').view(*target_states.shape[:2], -1, 84, 84)
+            
             optimizer.zero_grad()
-            reconstructed_states = model(states, actions, target_states)
-            loss = reconstruction_loss(reconstructed_states, target_states[1:,:,:,:,:])
+            reconstructed_states, vq_loss, encoding_idx = model(states, actions, target_states)
+            
+            # Compute loss
+            recon_loss = reconstruction_loss(reconstructed_states, target_states)
+            loss = recon_loss
+
+            if args.log:
+                wandb.log({'reconstruction_loss': recon_loss.item(), 'vq_loss': vq_loss.item(), 'total_loss': loss.item(), "uniue_encoding_idx": torch.unique(encoding_idx)})
+
             loss.backward()
             optimizer.step()
+            
+            # Update total loss
             total_loss += loss.item()
-            print(loss.item())
+            print(loss.item(), torch.unique(encoding_idx))
+        
+        # Log epoch loss
         print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {total_loss / len(dataloader)}')
 
+        if args.log:
+            if epoch % 10 == 0:
+                seq_0 = states[0,:]
+                tar_0 = target_states[0,:]
+                rec_0 = reconstructed_states[0,:]
+
+                seq_len = seq_0.shape[0]
+                for i in range(seq_len-1):
+
+                    #log to wandb these images
+                    # wandb.log({f'originals/original_{i}': [wandb.Image(recover_image(seq_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))]})
+                    # wandb.log({f'reconstructed/reconstructed_{i}': [wandb.Image(recover_image(rec_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))]})
+                    # wandb.log({f'targets/target_{i}': [wandb.Image(recover_image(tar_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))]})
+                    cv2.imwrite(f'originals1/original_{i}.png', recover_image(seq_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))
+                    cv2.imwrite(f'reconstructed1/reconstructed_{i}.png', recover_image(rec_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))
+                    cv2.imwrite(f'targets1/target_{i}.png', recover_image(tar_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))
 # Hyperparameters
 image_size = 84  # Assuming images are 84x84
 action_dim = 18  # Number of discrete actions in Atari
-embed_dim = 512  # Embedding dimension
-n_heads = 8  # Number of attention heads
-num_encoder_layers = 6  # Number of encoder layers
-num_decoder_layers = 6  # Number of decoder layers
-dim_feedforward = 2048  # Dimension of feedforward layers in transformer
+embed_dim = 128  # Embedding dimension
+n_heads = 4  # Number of attention heads
+num_encoder_layers = 4  # Number of encoder layers
+num_decoder_layers = 4  # Number of decoder layers
+dim_feedforward = 128  # Dimension of feedforward layers in transformer
 
 # Instantiate the model
 model = Seq2SeqTransformer(image_size, action_dim, embed_dim, n_heads, num_encoder_layers, num_decoder_layers, dim_feedforward).to('cuda')
@@ -265,9 +337,23 @@ transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
         ])
-dataset_org = OfflineEnvAtari(stack=False, path='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10').get_dataset()
-dataset = AtariSequenceDataset(dataset_org, 30, transform=transform)
+dataset_org = OfflineEnvAtari(stack=True, path='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10').get_dataset()
+dataset = AtariSequenceDataset(dataset_org, 40, transform=transform)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
 print(len(dataset))
-train_model(model, dataloader, optimizer, num_epochs=100)
+
+iterator = iter(dataloader)
+
+states, actions, target_states = next(iterator)
+states = states.permute(1,0,2,3,4)
+actions = actions.permute(1,0)
+target_states = target_states.permute(1,0,2,3,4)
+seq_0 = states[:,0]
+tar_0 = target_states[:,0]
+
+# for i in range(10):
+#     cv2.imwrite(f'coriginal_{i}.png', recover_image(seq_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))
+#     cv2.imwrite(f'ctarget_{i}.png', recover_image(tar_0[i].permute(1,2,0).detach().cpu().numpy().squeeze()))
+
+train_model(model, dataloader, optimizer, num_epochs=10000)
