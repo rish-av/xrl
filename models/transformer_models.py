@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn 
 from utils import generate_causal_mask
-from .vector_quantizers import EMAVectorQuantizer
+from .vector_quantizers import EMAVectorQuantizer, EnhancedEMAVectorQuantizer
 
 class PositionalEncoding(nn.Module):
     def __init__(self, model_dim, max_len=5000):
@@ -29,7 +29,7 @@ class TransformerEncoder(nn.Module):
             nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads),
             num_layers=num_layers
         )
-        self.vq_layer = EMAVectorQuantizer(num_embeddings, model_dim)
+        self.vq_layer = EnhancedEMAVectorQuantizer(num_embeddings, model_dim)
 
     def forward(self, x):
         seq_len = x.size(1)
@@ -60,7 +60,7 @@ class TransformerEncoderPerStates(nn.Module):
             nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads),
             num_layers=num_layers
         )
-        self.vq_layer = EMAVectorQuantizer(num_embeddings, model_dim)
+        self.vq_layer = EnhancedEMAVectorQuantizer(num_embeddings, model_dim)
 
     def forward(self, x):
         seq_len = x.size(1)

@@ -870,6 +870,9 @@ def train_model_patch_crop(model, dataloader, optimizer, criterion, scheduler, e
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss}")
         print(f"Learning Rate: {scheduler.get_last_lr()[0]}")
 
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), f"model_{epoch}.pth")
+
 from torch.optim.lr_scheduler import StepLR
 
 
@@ -882,7 +885,7 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=16, help="Embedding dimension")
     parser.add_argument('--nhead', type=int, default=4, help="Number of attention heads")
     parser.add_argument('--num_layers', type=int, default=2, help="Number of transformer layers")
-    parser.add_argument('--batch_size', type=int, default=16, help="Batch size")
+    parser.add_argument('--batch_size', type=int, default=4, help="Batch size")
     parser.add_argument('--num_embeddings', type=int, default=64, help="Number of embeddings for VQ")
 
     # Logging and experiment tracking
@@ -890,6 +893,7 @@ def parse_args():
     parser.add_argument('--wandb_project', type=str, default="atari-xrl", help="WandB project name")
     parser.add_argument('--wandb_entity', type=str, default="mail-rishav9", help="WandB entity name")
     parser.add_argument('--wandb_run_name', type=str, default="xrl_atari", help="Base name for WandB run")
+    parser.add_argument('--patch_size', type=int, default=4, help="Patch size for image transformer")
 
     return parser.parse_args()
 
@@ -913,13 +917,14 @@ if __name__ == "__main__":
     num_layers = args.num_layers  # Number of transformer layers
     batch_size = args.batch_size  # Batch size
     num_embeddings = args.num_embeddings  # Number of VQ-VAE embeddings
+    patch_size = args.patch_size  # Patch size for image transformer
 
     # Dataset and DataLoader
     dataset = AtariGrayscaleDataset(env_name, max_seq_len=max_seq_len, image_size=image_size)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Initialize model, optimizer, and loss function
-    model = CausalGrayscaleImageTransformerWithVQ(action_dim, embed_dim, nhead, num_layers, num_embeddings, image_size=image_size, patch_size=4).to("cuda")
+    model = CausalGrayscaleImageTransformerWithVQ(action_dim, embed_dim, nhead, num_layers, num_embeddings, image_size=image_size, patch_size=patch_size).to("cuda")
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scheduler = StepLR(optimizer, step_size=8, gamma=0.1)
     criterion = nn.MSELoss()
@@ -928,6 +933,7 @@ if __name__ == "__main__":
             f"{args.wandb_run_name}_{model.__class__.__name__}_"
             f"Embed{args.embed_dim}_Layers{args.num_layers}_Heads{args.nhead}_"
             f"SeqLen{args.max_seq_len}_Batch{args.batch_size}_Embeddings{args.num_embeddings}_"
+            f"patch_size{args.patch_size}_"
             f"Run{random.randint(1, 1000)}"
         )
         
@@ -943,3 +949,4 @@ if __name__ == "__main__":
 
     # Train the model
     train_model_patch_crop(model, dataloader, optimizer, criterion, scheduler, epochs=1000)
+    torch.save(model.state_dict(), 'model_atrai.pth')

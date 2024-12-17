@@ -57,24 +57,32 @@ model = instance(input_dim, model_dim, output_dim, num_heads, num_encoder_layers
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-dataset = D4RLDatasetMujoco(states, actions, next_states, sequence_length=25)
+dataset = D4RLDatasetMujoco(states, actions, next_states, sequence_length=60)
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
 
 model.eval()
 if model_load_path!='':
-    model.load_state_dict(torch.load(model_load_path))
+
+    checkpoint = torch.load(model_load_path)
+    if 'encoder.vq_layer.last_reset_epoch' in checkpoint:
+        del checkpoint['encoder.vq_layer.last_reset_epoch']
+
+# Load the adjusted state_dict into the model
+    model.load_state_dict(checkpoint, strict=False)
 
 
 
-clusters, kmeans, centers = cluster_codebook_vectors(model.encoder.vq_layer.embedding, 10)
-visualize_codebook_clusters(model.encoder.vq_layer.embedding, clusters, centers, env_name)
+model.encoder.vq_layer.visualize_codebook()
+
+# clusters, kmeans, centers = cluster_codebook_vectors(model.encoder.vq_layer.embedding, 10)
+# visualize_codebook_clusters(model.encoder.vq_layer.embedding, clusters, centers, env_name)
 
 
-# from utils import plot_distance_state
-segments = extract_overlapping_segments(dataset_org, 25, 100)
-plot_distances_minigrid(segments, model.encoder, 'distance_overlapping.png')
+# # from utils import plot_distance_state
+# segments = extract_overlapping_segments(dataset_org, 25, 100)
+# plot_distances_minigrid(segments, model.encoder, 'distance_overlapping.png')
 
 if args.train:
     model.train()
@@ -93,14 +101,14 @@ if args.train:
             output, vq_loss, encidx = model(src, tgt_input)
             
             # Compute loss
-            loss = criterion(output, tgt_output) + vq_loss
+            recon_loss = criterion(output, tgt_output)
+            loss = 2*recon_loss + vq_loss
 
             # Backward pass
             loss.backward()
             optimizer.step()
             
-            print(f"loss: {loss.item()}, vq_loss: {vq_loss.item()}, num_unique_ids: {len(torch.unique(encidx))}")
-
+            print(f"loss: {loss.item()}, vq_loss: {vq_loss.item()}, num_unique_ids: {len(torch.unique(encidx))} recon_loss: {recon_loss.item()}", model.encoder.vq_layer.get_codebook_metrics()['active_codes'], model.encoder.vq_layer.get_codebook_metrics()['avg_similarity'])
             epoch_loss += loss.item()
 
             if args.log:
@@ -114,5 +122,8 @@ if args.train:
 
         
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(dataloader)} num unique IDs {len (torch.unique(encidx))}")
+
+        if (epoch+1) % 5 == 0:
+            torch.save(model.state_dict(), model_save_path)
 
     torch.save(model.state_dict(), model_save_path)
