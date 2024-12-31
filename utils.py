@@ -14,7 +14,7 @@ import torch
 import matplotlib.pyplot as plt
 import random
 import torch.nn.functional as F
-import d4rl_atari
+# import d4rl_atari
 import gzip
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -614,7 +614,7 @@ def analyze_quantized_sequences2(quantized_sequences: List[List[int]],
                                  alpha=0.7,
                                  label=f'Partition {i}')
             
-            label = f'Partition {i}\nNodes: {len(partition)}\nAvg Seq Length: {avg_sequence_lengths[i]*3:.1f}'
+            label = f'Partition {i}\nNodes: {len(partition)}\nAvg Seq Length: {avg_sequence_lengths[i]:.1f}'
             plt.annotate(label,
                         xy=pos[i],
                         xytext=(0, 20),

@@ -14,12 +14,20 @@ from datetime import datetime
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--log', action='store_true', help='Enable wandb logging')
-    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--initial_tf', type=float, default=0.75)
+    parser.add_argument('--initial_tf', type=float, default=0.5)
     parser.add_argument('--tf_decay', type=float, default=0.85)
     parser.add_argument('--tag', type=str, default="vqvae")
+    parser.add_argument('--latent_dim', type=int, default=128)
+    parser.add_argument('--num_tokens', type=int, default=128)
+    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--n_layers', type=int, default=4)
+    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--beta', type=float, default=1.0)
+    parser.add_argument('--context_len', type=int, default=50)
+
     return parser.parse_args()
 
 
@@ -329,11 +337,17 @@ class VQVAE_TeacherForcing(nn.Module):
 
 
 
+def create_run_name(args):
+    # Create run name based on arguments, use all items in args (argparse object)
+    run_name = "_".join([f"{k}={v}" for k, v in vars(args).items()])
+    return run_name
+
+
 def train_vqvae_teacher_forcing(model, dataloader, optimizer, args):
     if args.log:
-        run_name = f"{args.tag}_vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}" 
+        run_name = f"{create_run_name(args)}_vqvae_{datetime.now().strftime('%Y%m%d_%H%M%S')}" 
         wandb.init(
-            project="vqvae-training",
+            project="vqvae-final",
             name=run_name,
             config={
                 **model.model_config,
@@ -393,8 +407,9 @@ def train_vqvae_teacher_forcing(model, dataloader, optimizer, args):
             total_euclidean += avg_euclidean.item()
             total_min_euclidean += min_euclidean.item()
 
-            if batch_idx % 2500 == 0:
-                torch.save(model.state_dict(), f"weights/vqvae_mujoco_teacher_forcing_no_skip_connect_run_2_tf0.45_schedule_llr_beta1.0_len50{epoch}_{batch_idx}.pt")
+            if batch_idx % 3500 == 0:
+                name = create_run_name(args)
+                torch.save(model.state_dict(), f"{name}_{epoch}_{batch_idx}.pt")
 
             if batch_idx > 0 and batch_idx % 20000 == 0:
                 teacher_forcing_ratio *= args.tf_decay
@@ -478,7 +493,7 @@ np.warnings = warnings
 
 if __name__ == "__main__":
     args = parse_args()
-    context_len = 50
+    context_len = args.context_len
     # Load data
     env_name = "halfcheetah-medium-v2"
     states, actions = load_d4rl_data(env_name)
@@ -488,12 +503,12 @@ if __name__ == "__main__":
     # Model parameters
     state_dim = states.shape[1]
     action_dim = actions.shape[1]
-    latent_dim = 128
-    num_tokens = 256
-    hidden_size = 128
-    n_layers = 6
-    n_heads = 8
-    beta = 1.0
+    latent_dim = args.latent_dim
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    n_layers = args.n_layers
+    n_heads = args.n_heads
+    beta = args.beta    
 
     # Create model
     model = VQVAE_TeacherForcing(
@@ -509,17 +524,11 @@ if __name__ == "__main__":
     ).to("cuda")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    weights = torch.load('/home/rishav/scratch/xrl/weights/vqvae_mujoco_teacher_forcing_no_skip_connect_run_2_tf0.45_schedule_llr_beta1.0_len500_42500.pt')
+    weights = torch.load('/home/ubuntu/xrl/weights/vqvae_best_model.pt')
     model.load_state_dict(weights)
-    # train_vqvae_teacher_forcing(model, dataloader, optimizer, args)
+    train_vqvae_teacher_forcing(model, dataloader, optimizer, args)
 
     from utils import build_transition_matrix, mcl_graph_cut, visualize_clusters
-
-
-    
-
-
-    # print(len(dataloader))
 
     from utils import render_target_and_predicted_frames, plot_pca_clusters, build_cluster_transition_graph, analyze_quantized_sequences2
 
@@ -548,20 +557,23 @@ if __name__ == "__main__":
             for ind in indices.cpu().numpy():
                 all_indices.append(list(ind))
                 count += 1
-        # transition_matrix = build_transition_matrix(all_indices)
-        # clusters = mcl_graph_cut(model.vector_quantizer.codebook.weight.cpu().numpy(), transition_matrix)
-        # fig = visualize_clusters(model.vector_quantizer.codebook.weight.cpu().numpy(), clusters, transition_matrix)
-        # build_cluster_transition_graph(model.vector_quantizer.codebook.weight.cpu().numpy(), all_indices, 10, 20, plot_path="cluster_transition_graph.png")
-        # analyze_quantized_sequences2(all_indices, model.vector_quantizer.codebook.weight.cpu().numpy(), 10, distance_weight=3, transition_weight=0.5,  save_dir= "yoyo")
+            
+            # if count == 5000:
+            #     break
+        transition_matrix = build_transition_matrix(all_indices)
+        clusters = mcl_graph_cut(model.vector_quantizer.codebook.weight.cpu().numpy(), transition_matrix)
+        fig = visualize_clusters(model.vector_quantizer.codebook.weight.cpu().numpy(), clusters, transition_matrix)
+        build_cluster_transition_graph(model.vector_quantizer.codebook.weight.cpu().numpy(), all_indices, 10, 20, plot_path="cluster_transition_graph.png")
+        analyze_quantized_sequences2(all_indices, model.vector_quantizer.codebook.weight.cpu().numpy(), 10, distance_weight=3, transition_weight=0.5,  save_dir= "yoyo")
 
-        from utils import get_partition_labels, save_cluster_frames, get_states_by_cluster
-        sequence_labels, partition_labels = get_partition_labels(
-            all_indices,
-            model.vector_quantizer.codebook.weight.cpu().numpy(),
-            n_cuts=10
-        )
-        cluster_states = get_states_by_cluster(all_states, sequence_labels)
-        env = gym.make(env_name) 
+        # from utils import get_partition_labels, save_cluster_frames, get_states_by_cluster
+        # sequence_labels, partition_labels = get_partition_labels(
+        #     all_indices,
+        #     model.vector_quantizer.codebook.weight.cpu().numpy(),
+        #     n_cuts=10
+        # )
+        # cluster_states = get_states_by_cluster(all_states, sequence_labels)
+        # env = gym.make(env_name) 
 
         # save_cluster_frames(env, cluster_states, save_dir="cluster_frames", n_frames=100)
     with torch.no_grad():
