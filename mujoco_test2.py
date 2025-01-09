@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument('--n_heads', type=int, default=8)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--context_len', type=int, default=50)
+    parser.add_argument('--dataset_type', type=str, default='overlap', help='Overlap sequences')
 
     return parser.parse_args()
 
@@ -90,6 +91,127 @@ def load_d4rl_data(env_name):
     states = dataset['observations']
     actions = dataset['actions']
     return states, actions
+
+
+
+
+
+
+class VectorQuantizerSTE(nn.Module):
+    def __init__(self, num_tokens, latent_dim, beta, decay=0.99, temp_init=1.0, temp_min=0.1, anneal_rate=0.00003):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.latent_dim = latent_dim
+        self.beta = beta
+        self.decay = decay
+
+        # Temperature annealing parameters
+        self.register_buffer('temperature', torch.tensor(temp_init))
+        self.temp_min = temp_min
+        self.anneal_rate = anneal_rate
+
+        # Codebook
+        self.codebook = nn.Embedding(num_tokens, latent_dim)
+        nn.init.uniform_(self.codebook.weight, -1.0 / num_tokens, 1.0 / num_tokens)
+
+        # EMA related buffers
+        self.register_buffer('ema_cluster_size', torch.zeros(num_tokens))
+        self.register_buffer('ema_w', torch.zeros(num_tokens, latent_dim))
+        self.register_buffer('usage_count', torch.zeros(num_tokens))
+
+        # Affine reparameterization parameters
+        self.c_mean = nn.Parameter(torch.zeros(latent_dim))
+        self.c_std = nn.Parameter(torch.ones(latent_dim))
+
+    def anneal_temperature(self):
+        self.temperature = torch.max(
+            torch.tensor(self.temp_min, device=self.temperature.device),
+            self.temperature * np.exp(-self.anneal_rate)
+        )
+
+    def forward(self, latent):
+        batch_size, seq_len, latent_dim = latent.shape
+        flat_input = latent.reshape(-1, latent_dim)
+
+        # Reparameterize codebook
+        reparameterized_codebook = self.c_mean + self.c_std * self.codebook.weight
+
+        # Calculate cosine similarity
+        latent_normalized = F.normalize(flat_input, dim=-1)
+        codebook_normalized = F.normalize(reparameterized_codebook, dim=-1)
+        cosine_sim = torch.matmul(latent_normalized, codebook_normalized.t())
+
+        # Calculate distances for quantization
+        distances = (
+            torch.sum(flat_input ** 2, dim=1, keepdim=True) 
+            - 2 * torch.matmul(flat_input, reparameterized_codebook.t())
+            + torch.sum(reparameterized_codebook ** 2, dim=1)
+        )
+
+        # Apply temperature scaling to distances
+        scaled_distances = distances / max(self.temperature.item(), 1e-5)
+
+        # Softmax with temperature for stochastic relaxation
+        soft_assign = F.softmax(-scaled_distances, dim=-1)
+
+        # Sample indices probabilistically
+        indices = torch.multinomial(soft_assign, 1).squeeze(-1)
+        hard_assign = F.one_hot(indices, self.num_tokens).float()
+        assign = hard_assign + soft_assign - soft_assign.detach()
+
+        # Update usage count
+        self.usage_count[indices] += 1
+
+        # Calculate average cosine similarity with chosen codes
+        selected_cosine_sim = cosine_sim[torch.arange(len(indices)), indices].mean()
+
+        # EMA update
+        if self.training:
+            cluster_size = hard_assign.sum(0)
+            self.ema_cluster_size = self.decay * self.ema_cluster_size + (1 - self.decay) * cluster_size
+
+            embed_sum = torch.matmul(hard_assign.t(), flat_input)
+            self.ema_w = self.decay * self.ema_w + (1 - self.decay) * embed_sum
+
+            # Normalize
+            n = self.ema_cluster_size.sum()
+            cluster_size = (self.ema_cluster_size + 1e-5) / (n + self.num_tokens * 1e-5) * n
+            embed_normalized = self.ema_w / cluster_size.unsqueeze(-1)
+            self.codebook.weight.data.copy_(embed_normalized)
+
+            # Anneal temperature
+            self.anneal_temperature()
+
+        # Calculate Euclidean distances between codebook vectors
+        codebook_distances = torch.cdist(reparameterized_codebook, reparameterized_codebook)
+        mask = ~torch.eye(codebook_distances.shape[0], dtype=bool, device=codebook_distances.device)
+        masked_distances = codebook_distances[mask]
+        avg_euclidean = masked_distances.mean()
+        min_euclidean = masked_distances.min()
+
+        # Quantize
+        quantized = torch.matmul(assign, reparameterized_codebook)
+        quantized = quantized.view(batch_size, seq_len, latent_dim)
+
+        # Loss
+        commitment_loss = self.beta * F.mse_loss(latent.detach(), quantized)
+        codebook_loss = F.mse_loss(latent, quantized.detach())
+
+        # Straight-through estimator
+        quantized = latent + (quantized - latent).detach()
+
+        # Calculate perplexity
+        avg_probs = torch.mean(hard_assign, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        # Gradient gap regularization
+        non_quantized_grad = flat_input.clone().detach()
+        quantized_grad = quantized.clone().detach()
+        gradient_gap = torch.norm(non_quantized_grad - quantized_grad)
+
+        return (quantized, indices, commitment_loss, codebook_loss, perplexity, selected_cosine_sim, avg_euclidean, min_euclidean, gradient_gap)
+
+
 
 
 class VectorQuantizer(nn.Module):
@@ -203,11 +325,11 @@ class VQVAE_TeacherForcing(nn.Module):
 
         # Embedding and normalization layers
         self.state_embedding = nn.Sequential(
-            nn.LayerNorm(state_dim),
+            # nn.LayerNorm(state_dim),
             nn.Linear(state_dim, hidden_size)
         )
         self.action_embedding = nn.Sequential(
-            nn.LayerNorm(action_dim),
+            # nn.LayerNorm(action_dim),
             nn.Linear(action_dim, hidden_size)
         )
         self.pos_embedding = nn.Embedding(context_len, hidden_size)
@@ -230,7 +352,7 @@ class VQVAE_TeacherForcing(nn.Module):
 
         # Latent projection
         self.to_latent = nn.Sequential(
-            nn.LayerNorm(hidden_size),
+            # nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, latent_dim)
         )
 
@@ -241,7 +363,7 @@ class VQVAE_TeacherForcing(nn.Module):
 
         # Decoder layers
         self.from_latent = nn.Sequential(
-            nn.LayerNorm(latent_dim),
+            # nn.LayerNorm(latent_dim),
             nn.Linear(latent_dim, hidden_size)
         )
 
@@ -497,7 +619,11 @@ if __name__ == "__main__":
     # Load data
     env_name = "halfcheetah-medium-v2"
     states, actions = load_d4rl_data(env_name)
-    dataset = D4RLStateActionDatasetNo(states, actions, context_len=context_len)
+    if args.dataset_type=='overlap':
+        dataset = D4RLStateActionDataset(states, actions, context_len=context_len)
+    else:
+        print("####### creating dataset with no overlap ########")
+        dataset = D4RLStateActionDatasetNo(states, actions, context_len=context_len)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
     # Model parameters
@@ -524,8 +650,13 @@ if __name__ == "__main__":
     ).to("cuda")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    weights = torch.load('/home/ubuntu/xrl/weights/vqvae_best_model.pt')
-    model.load_state_dict(weights)
+    # weights = torch.load('log=True_lr=0.0001_batch_size=32_epochs=10_initial_tf=0.4_tf_decay=0.85_tag=vqvae_latent_dim=128_num_tokens=128_hidden_size=128_n_layers=4_n_heads=8_beta=1.0_context_len=30_dataset_type=overlap_0_3500.pt', weights_only=True)
+
+
+    # # for k,v in weights.items():
+    # #     if k in model.state_dict() and v.shape == model.state_dict()[k].shape:
+    # #         model.state_dict()[k].copy_(v)
+    # model.load_state_dict(weights)
     train_vqvae_teacher_forcing(model, dataloader, optimizer, args)
 
     from utils import build_transition_matrix, mcl_graph_cut, visualize_clusters
@@ -542,7 +673,7 @@ if __name__ == "__main__":
             states = batch['states'].to("cuda")
             actions = batch['actions'].to("cuda")
             targets = batch['targets'].to("cuda")
-            out = model(states, actions, targets, teacher_forcing_ratio=0.0)
+            out = model(states, actions, targets, teacher_forcing_ratio=args.initial_tf)
 
             for state_seq in states:
                 curr_seq_states = []

@@ -74,17 +74,53 @@ if args.log:
 
 
 
+
+class MiniGridDataset(Dataset):
+    def __init__(self, env_name, max_seq_len=30, transform=None, frame_skip=1, action_dim=6):
+        self.dataset = gym.make(env_name).get_dataset()
+        self.max_seq_len = max_seq_len
+        self.transform = transform
+        self.frame_skip = frame_skip
+        self.action_dim = action_dim
+        self.total_frames = len(self.dataset['observations'])
+        self.valid_starts = self._get_valid_start_indices()
+
+    def _get_valid_start_indices(self):
+        valid_starts = []
+        for i in range(0, self.total_frames - self.max_seq_len * self.frame_skip, self.frame_skip):
+            terminals = self.dataset['terminals'][i:i + self.max_seq_len * self.frame_skip:self.frame_skip]
+            if not np.any(terminals):
+                valid_starts.append(i)
+        return valid_starts
+
+    def _one_hot_encode(self, actions):
+        one_hot = np.zeros((len(actions), self.action_dim), dtype=np.float32)
+        for idx, action in enumerate(actions):
+            print(action)
+            one_hot[idx, int(action)] = 1.0
+        return one_hot
+
+    def __len__(self):
+        return len(self.valid_starts)
+
+    def __getitem__(self, idx):
+        start_idx = self.valid_starts[idx]
+        indices = range(start_idx, start_idx + self.max_seq_len * self.frame_skip, self.frame_skip)
+        states = [self.dataset['observations'][i] for i in indices]
+        actions = [int(self.dataset['actions'][i]) for i in indices]  # Ensure actions are integers
+        target_states = [self.dataset['observations'][i + 1] for i in indices]
+        states = np.array(states)
+        target_states = np.array(target_states)
+        actions = np.array(actions, dtype=int)  # Explicit integer conversion
+        states = torch.FloatTensor(states).permute(0, 3, 1, 2)
+        actions = torch.LongTensor(actions)  # Ensure LongTensor receives integers
+        target_states = torch.FloatTensor(target_states).permute(0, 3, 1, 2)
+        return states, actions, target_states
+
+
+
 class AtariGrayscaleDataset(Dataset):
     def __init__(self, dataset_path, max_seq_len=30, transform=None, frame_skip=4):
-        """
-        Atari Grayscale Dataset for sequence-to-sequence modeling with frame skipping.
-
-        Args:
-            dataset_path (str): Path to the dataset.
-            max_seq_len (int): Maximum sequence length for each sample.
-            transform (callable, optional): Optional transform to apply to frames.
-            frame_skip (int): Number of frames to skip (default is 1, i.e., no skipping).
-        """
         self.dataset = OfflineEnvAtari(stack=True, path=dataset_path).get_dataset()  # Load metadata
         self.max_seq_len = max_seq_len
         self.transform = transform
@@ -94,9 +130,6 @@ class AtariGrayscaleDataset(Dataset):
         self.valid_starts = self._get_valid_start_indices()
 
     def _get_valid_start_indices(self):
-        """
-        Identify valid starting indices for sequences, avoiding episode boundaries.
-        """
         valid_starts = []
         for i in range(0, self.total_frames - self.max_seq_len * self.frame_skip, self.frame_skip):
             # Check for terminal flags if available
@@ -112,15 +145,6 @@ class AtariGrayscaleDataset(Dataset):
         return len(self.valid_starts)
 
     def __getitem__(self, idx):
-        """
-        Get a sequence of states, actions, and the corresponding target states.
-
-        Args:
-            idx (int): Index of the sequence start.
-
-        Returns:
-            tuple: (states, actions, target_states)
-        """
         start_idx = self.valid_starts[idx]
         indices = range(start_idx, start_idx + self.max_seq_len * self.frame_skip, self.frame_skip)
 
@@ -143,214 +167,6 @@ class AtariGrayscaleDataset(Dataset):
         target_states = torch.FloatTensor(target_states) # Add channel dimension
 
         return states, actions, target_states
-
-class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost=1.0):
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.commitment_cost = commitment_cost
-
-        # Initialize embedding table
-        self.embedding = nn.Parameter(torch.randn(num_embeddings, embedding_dim))
-    
-    def forward(self, inputs):
-        """
-        Inputs:
-            inputs: Tensor of shape (B, T, embed_dim)
-        Outputs:
-            quantized: Quantized tensor of shape (B, T, embed_dim)
-            loss: Scalar loss value
-            encoding_indices: Tensor of shape (B, T) containing the indices of the closest embeddings
-        """
-        # Input shape: (B, T, embed_dim)
-        input_shape = inputs.shape
-
-        # Flatten input: (B * T, embed_dim)
-        flat_input = inputs.view(-1, self.embedding_dim)
-
-        # Compute distances between inputs and embedding vectors
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                     + torch.sum(self.embedding**2, dim=1)
-                     - 2 * torch.matmul(flat_input, self.embedding.t()))
-        
-        # Find nearest embedding index for each input vector
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        
-        # One-hot encode the indices: (B * T, num_embeddings)
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        
-        # Quantize the input: (B * T, embed_dim)
-        quantized = torch.matmul(encodings, self.embedding).view(input_shape)
-        
-        # Compute losses
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        
-        # Add the straight-through gradient estimator
-        quantized = inputs + (quantized - inputs).detach()
-        
-        # Return quantized output in original shape, loss, and encoding indices
-        return quantized, loss, encoding_indices.reshape(input_shape[0], input_shape[1])
-
-
-
-class VectorQuantizer2(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.commitment_cost = commitment_cost
-        
-        # Create embedding table
-        self.embed = nn.Embedding(num_embeddings, embedding_dim)
-        self.embed.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
-        
-    def forward(self, inputs):
-        # Save original shape and flatten input
-        input_shape = inputs.shape
-        flat_input = inputs.reshape(-1, self.embedding_dim)
-        
-        # Calculate distances
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                    + torch.sum(self.embed.weight**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self.embed.weight.t()))
-        
-        # Get encoding indices and quantized embeddings
-        encoding_indices = torch.argmin(distances, dim=1)
-        quantized = self.embed(encoding_indices)
-        
-        # Calculate loss
-        e_latent_loss = F.mse_loss(quantized.detach(), flat_input)
-        q_latent_loss = F.mse_loss(quantized, flat_input.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        
-        # Straight-through estimator
-        quantized = flat_input + (quantized - flat_input).detach()
-        
-        # Reshape quantized and indices back to input shape
-        quantized = quantized.view(input_shape)
-        
-        return quantized, loss, encoding_indices
-
-class AtariSeq2SeqTransformerVQPretrain(nn.Module):
-    def __init__(self, img_size, embed_dim, num_heads, num_layers, action_dim, num_embeddings, max_seq_len=1024, pretrain_steps=10000):
-        super(AtariSeq2SeqTransformerVQPretrain, self).__init__()
-
-        self.img_size = img_size
-        self.embed_dim = embed_dim
-        self.pretrain_steps = pretrain_steps  # Number of steps before enabling quantization
-        self.current_step = 0  # Initialize training step counter
-
-        # State encoder: extracts spatial embeddings from frames
-        self.state_encoder = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4, padding=0), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0), nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, embed_dim),  # Match embedding dimension
-            nn.Tanh()
-        )
-
-        # Action embedding: converts discrete actions to embeddings
-        self.action_embedding = nn.Embedding(action_dim, embed_dim)
-
-        # Positional embeddings
-        self.positional_embedding = nn.Parameter(torch.zeros(1, max_seq_len, embed_dim))
-
-        # Transformer encoder-decoder architecture
-        self.encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=4 * embed_dim, dropout=0.1, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
-
-        self.decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=4 * embed_dim, dropout=0.1, batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=num_layers)
-
-        # Vector Quantizer
-        self.vq = VectorQuantizer(num_embeddings, embed_dim)
-
-        # Frame reconstruction head
-        self.reconstruct = nn.Sequential(
-            nn.Linear(embed_dim, 3136),
-            nn.Unflatten(1, (64, 7, 7)),
-            nn.ConvTranspose2d(64, 64, kernel_size=3, stride=1, padding=0), nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=0), nn.ReLU(),
-            nn.ConvTranspose2d(32, 4, kernel_size=8, stride=4, padding=0), nn.Sigmoid()  # Normalize output
-        )
-
-    def generate_causal_mask(self, seq_len, device):
-        """
-        Generate a causal mask to ensure predictions depend only on past and current inputs.
-        """
-        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1)
-        return mask.to(device)
-
-    def forward(self, states, actions, target_states=None):
-        """
-        states: [B, T, 1, H, W] - input grayscale frames
-        actions: [B, T] - input actions
-        target_states: [B, T, 1, H, W] - ground truth future frames
-        """
-        B, T, C, H, W = states.shape
-
-        # Encode states into embeddings
-        state_embeddings = self.state_encoder(states.view(-1, C, H, W))  # [B*T, embed_dim]
-        state_embeddings = state_embeddings.view(B, T, -1)  # [B, T, embed_dim]
-
-        # Embed actions
-        action_embeddings = self.action_embedding(actions)  # [B, T, embed_dim]
-
-        # Combine state and action embeddings
-        seq_embeddings = state_embeddings + action_embeddings  # Element-wise addition
-        seq_embeddings += self.positional_embedding[:, :T, :]  # Add positional embeddings
-
-        # Generate causal mask for the encoder
-        causal_mask = self.generate_causal_mask(seq_embeddings.size(1), states.device)
-
-        # Forward through encoder
-        encoder_output = self.encoder(seq_embeddings, mask=causal_mask)  # [B, T, embed_dim]
-
-        # Apply Vector Quantizer after pretraining
-        if self.current_step >= self.pretrain_steps:
-            quantized, vq_loss, encoding_indices = self.vq(encoder_output)  # Quantized embeddings for decoder
-        else:
-            quantized = encoder_output  # Skip quantization during pretraining
-            vq_loss = torch.tensor(0.0, device=states.device)  # No VQ loss
-            encoding_indices = None
-
-        # Prepare target input for the decoder
-        if target_states is not None:
-            # Teacher forcing: use shifted target frames
-            target_embeddings = self.state_encoder(target_states.view(-1, C, H, W))
-            target_embeddings = target_embeddings.view(B, T, -1)  # [B, T, embed_dim]
-            target_embeddings = target_embeddings[:, :-1, :]  # Shift by one time step
-            target_embeddings = target_embeddings + self.positional_embedding[:, :target_embeddings.size(1), :]
-
-            # Causal mask for the decoder
-            tgt_mask = self.generate_causal_mask(target_embeddings.size(1), states.device)
-
-            # Decoder forward pass
-            outputs = self.decoder(target_embeddings, quantized, tgt_mask=tgt_mask)  # [B, T-1, embed_dim]
-        else:
-            # During inference, autoregressively predict frames
-            outputs = quantized
-
-        # Reconstruct frames from Transformer output embeddings
-        frame_embeddings = outputs  # [B, T-1, embed_dim] (or [B, T, embed_dim] during inference)
-        predicted_frames = self.reconstruct(frame_embeddings.reshape(-1, self.embed_dim))  # [B*(T-1), 1, H, W]
-        predicted_frames = predicted_frames.view(B, -1, C, H, W)  # [B, T-1, 1, H, W]
-
-        # Increment the step counter
-        self.current_step += 1
-
-        return predicted_frames, vq_loss, encoding_indices
-
-
 
 def diversity_loss(embeddings):
     similarity = torch.matmul(embeddings, embeddings.t())
@@ -381,20 +197,13 @@ class EnhancedVectorQuantizer(nn.Module):
         self.entropy_weight = entropy_weight
         self.temperature = temperature
         self.min_usage_threshold = min_usage_threshold
-        
-        # Initialize embeddings with orthogonal vectors
         self.embed = nn.Embedding(num_embeddings, embedding_dim)
         nn.init.orthogonal_(self.embed.weight.data)
-        
-        # Tracking buffers
         self.register_buffer('code_usage', torch.zeros(num_embeddings))
         
     def reinit_unused_codes(self):
-        # Get usage statistics
         total_usage = self.code_usage.sum()
         usage_prob = self.code_usage / total_usage
-        
-        # Find unused codes
         unused_mask = usage_prob < self.min_usage_threshold
         
         if unused_mask.any():
@@ -678,240 +487,6 @@ class AtariPatchSeq2SeqTransformerVQ(nn.Module):
         return final_frames, vq_loss, encoding_indices
 
 
-class HierarchicalVQ(nn.Module):
-    def __init__(self, patch_num_embeddings, state_num_embeddings, embed_dim, commitment_cost=0.25):
-        super().__init__()
-        
-        self.patch_num_embeddings = patch_num_embeddings
-        self.state_num_embeddings = state_num_embeddings
-        self.embed_dim = embed_dim
-        
-        # First level VQ for patches
-        self.patch_vq = VectorQuantizer2(
-            num_embeddings=patch_num_embeddings,
-            embedding_dim=embed_dim,
-            commitment_cost=commitment_cost
-        )
-        
-        # Projection network for patch distribution
-        self.distribution_projection = nn.Sequential(
-            nn.Linear(patch_num_embeddings, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
-        )
-        
-        # Second level VQ for states
-        self.state_vq = VectorQuantizer2(
-            num_embeddings=state_num_embeddings,
-            embedding_dim=embed_dim,
-            commitment_cost=commitment_cost
-        )
-        
-    def forward(self, patch_embeddings):
-        B, N, D = patch_embeddings.shape
-        
-        # First level: quantize patches
-        flat_patches = patch_embeddings.reshape(-1, D)
-        patch_quantized, patch_loss, patch_indices = self.patch_vq(flat_patches)
-        patch_quantized = patch_quantized.view(B, N, D)
-        patch_indices = patch_indices.view(B, N)
-        
-        # Create patch distribution
-        patch_dist = F.one_hot(patch_indices, num_classes=self.patch_num_embeddings).float()
-        patch_dist = patch_dist.mean(dim=1)  # [B, patch_num_embeddings]
-        
-        # Project distribution to embedding space
-        state_embeddings = self.distribution_projection(patch_dist)  # [B, embed_dim]
-        
-        # Second level: quantize state embeddings
-        state_quantized, state_loss, state_indices = self.state_vq(state_embeddings.unsqueeze(1))
-        
-        total_loss = patch_loss + state_loss
-        
-        return patch_quantized, state_quantized.squeeze(1), total_loss, patch_indices, state_indices
-
-class AtariPatchSeq2SeqTransformerHVQ(nn.Module):
-    def __init__(self, img_size, patch_size, embed_dim, num_heads, num_layers, 
-                 action_dim, patch_num_embeddings, state_num_embeddings, max_seq_len=1024):
-        super().__init__()
-        
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        
-        # Calculate number of patches
-        self.num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
-        
-        # Patch embedding
-        self.patch_embed = nn.Sequential(
-            nn.Conv2d(4, embed_dim, kernel_size=patch_size, stride=patch_size),
-            nn.LayerNorm([embed_dim, img_size[0] // patch_size, img_size[1] // patch_size])
-        )
-        
-        # Action embedding
-        self.action_embedding = nn.Embedding(action_dim, embed_dim)
-        
-        # Positional embeddings
-        self.register_buffer('pos_embed', self.create_positional_embedding(
-            max_seq_len, self.num_patches, embed_dim))
-        
-        # Transformer encoder
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * embed_dim,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-        
-        # Transformer decoder
-        decoder_layers = nn.TransformerDecoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * embed_dim,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layers, num_layers)
-        
-        # Hierarchical VQ
-        self.hvq = HierarchicalVQ(
-            patch_num_embeddings=patch_num_embeddings,
-            state_num_embeddings=state_num_embeddings,
-            embed_dim=embed_dim
-        )
-        
-        # Frame reconstruction
-        self.reconstruct = nn.Sequential(
-            nn.Linear(embed_dim, 4 * patch_size * patch_size),  # Output channels * patch dimensions
-            nn.ReLU(),
-            nn.Unflatten(1, (4, patch_size, patch_size))  # Reshape to patch format
-        )
-        
-    def create_positional_embedding(self, max_seq_len, num_patches, embed_dim):
-        """
-        Create positional embeddings for both temporal and spatial dimensions.
-        
-        Args:
-            max_seq_len (int): Maximum sequence length
-            num_patches (int): Number of patches per frame
-            embed_dim (int): Embedding dimension
-        """
-        pos_embed = torch.zeros(1, max_seq_len, num_patches, embed_dim)
-        
-        # Generate temporal positional embeddings
-        time_pos = torch.arange(max_seq_len).float().unsqueeze(1).unsqueeze(1)  # [max_seq_len, 1, 1]
-        patch_pos = torch.arange(num_patches).float().unsqueeze(0).unsqueeze(2)  # [1, num_patches, 1]
-        
-        # Calculate dimension factors
-        dim = torch.arange(0, embed_dim, 2).float()
-        div_term = 10000.0 ** (dim / embed_dim)
-        
-        # Broadcast dimensions properly
-        time_pos = time_pos / div_term.view(1, 1, -1)  # [max_seq_len, 1, embed_dim//2]
-        patch_pos = patch_pos / div_term.view(1, 1, -1)  # [1, num_patches, embed_dim//2]
-        
-        # Fill in the positional embeddings
-        pos_embed[0, :, :, 0::2] = torch.sin(time_pos) + torch.sin(patch_pos)
-        pos_embed[0, :, :, 1::2] = torch.cos(time_pos) + torch.cos(patch_pos)
-        
-        return pos_embed
-    
-    def generate_causal_mask(self, seq_len, device):
-        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1)
-        return mask.to(device)
-    
-    def forward(self, states, actions, target_states=None):
-        B, T, C, H, W = states.shape
-        
-        # Extract and embed patches
-        states_reshaped = states.view(-1, C, H, W)
-        patch_embeddings = self.patch_embed(states_reshaped)  # [B*T, E, H', W']
-        patch_embeddings = patch_embeddings.flatten(2).transpose(1, 2)  # [B*T, num_patches, embed_dim]
-        patch_embeddings = patch_embeddings.view(B, T, self.num_patches, -1)
-        
-        # Add positional embeddings
-        patch_embeddings = patch_embeddings + self.pos_embed[:, :T, :, :]
-        
-        # Add action embeddings
-        action_embeddings = self.action_embedding(actions)  # [B, T, embed_dim]
-        action_embeddings = action_embeddings.unsqueeze(2).expand(-1, -1, self.num_patches, -1)
-        combined_embeddings = patch_embeddings + action_embeddings
-        
-        # Reshape for transformer
-        seq_embeddings = combined_embeddings.view(B * T, self.num_patches, -1)
-        
-        # Apply hierarchical VQ
-        patch_quantized, state_quantized, vq_loss, patch_indices, state_indices = self.hvq(seq_embeddings)
-        
-        # Reshape state quantized for sequence processing
-        state_quantized = state_quantized.view(B, T, -1)  # [B, T, embed_dim]
-        
-        if target_states is not None:
-            # Process target states
-            target_embeddings = self.patch_embed(target_states.view(-1, C, H, W))
-            target_embeddings = target_embeddings.flatten(2).transpose(1, 2)
-            target_embeddings = target_embeddings.view(B, T, self.num_patches, -1)
-            target_embeddings = target_embeddings + self.pos_embed[:, :T, :, :]
-            
-            # Shift target embeddings by one timestep
-            target_embeddings = target_embeddings[:, :-1]  # [B, T-1, num_patches, embed_dim]
-            
-            # Prepare memory from state quantized
-            memory = state_quantized.unsqueeze(2)  # [B, T, 1, embed_dim]
-            memory = memory.expand(-1, -1, self.num_patches, -1)  # [B, T, num_patches, embed_dim]
-            
-            # Reshape for decoder
-            target_embeddings = target_embeddings.reshape(B, (T-1) * self.num_patches, -1)
-            memory = memory.reshape(B, T * self.num_patches, -1)
-            
-            # Decoder forward pass with causal mask
-            outputs = self.decoder(
-                target_embeddings,
-                memory,
-                tgt_mask=self.generate_causal_mask(target_embeddings.size(1), states.device)
-            )
-            time_steps = T-1
-        else:
-            # During inference, prepare memory from state quantized
-            memory = state_quantized.unsqueeze(2).expand(-1, -1, self.num_patches, -1)
-            outputs = memory.view(B, T * self.num_patches, -1)
-            time_steps = T
-            
-        # Initialize output tensor for final frames
-        final_frames = torch.zeros(B, time_steps, C, H, W, device=states.device)
-        
-        # Process each batch and time step
-        outputs = outputs.view(B, time_steps, self.num_patches, -1)
-        
-        # Process patches for each time step
-        for b in range(B):
-            for t in range(time_steps):
-                patch_grid = torch.zeros(C, H, W, device=states.device)
-                
-                # Process each patch
-                for i in range(self.num_patches):
-                    # Get patch embedding and reconstruct
-                    patch_emb = outputs[b, t, i].unsqueeze(0)  # Add batch dimension
-                    patch = self.reconstruct(patch_emb).squeeze(0)  # Remove batch dimension
-                    
-                    # Calculate patch position
-                    h_idx = (i // (W // self.patch_size)) * self.patch_size
-                    w_idx = (i % (W // self.patch_size)) * self.patch_size
-                    
-                    # Place patch in the correct position
-                    patch_grid[:, h_idx:h_idx + self.patch_size, w_idx:w_idx + self.patch_size] = patch
-                
-                final_frames[b, t] = patch_grid
-        
-        return final_frames, vq_loss, state_indices
-
-        
-        # Rest of the forward pass remains the same...
-
 
 
 class AtariSeq2SeqTransformerVQ(nn.Module):
@@ -967,57 +542,81 @@ class AtariSeq2SeqTransformerVQ(nn.Module):
         mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1)
         return mask.to(device)
 
-    def forward(self, states, actions, target_states=None):
-        """
-        states: [B, T, 1, H, W] - input grayscale frames
-        actions: [B, T] - input actions
-        target_states: [B, T, 1, H, W] - ground truth future frames
-        """
+    def forward(self, states, actions, target_states=None, sampling_probability=0.9):
         B, T, C, H, W = states.shape
 
         # Encode states into embeddings
-        state_embeddings = self.state_encoder(states.view(-1, C, H, W))  # [B*T, embed_dim]
-        state_embeddings = state_embeddings.view(B, T, -1)  # [B, T, embed_dim]
+        state_embeddings = self.state_encoder(states.view(-1, C, H, W))
+        state_embeddings = state_embeddings.view(B, T, -1)
 
         # Embed actions
-        action_embeddings = self.action_embedding(actions)  # [B, T, embed_dim]
+        action_embeddings = self.action_embedding(actions)
 
         # Combine state and action embeddings
-        seq_embeddings = state_embeddings + action_embeddings  # Element-wise addition
-        seq_embeddings += self.positional_embedding[:, :T, :]  # Add positional embeddings
-
-        # Generate causal mask for the encoder
-        causal_mask = self.generate_causal_mask(seq_embeddings.size(1), states.device)
+        seq_embeddings = state_embeddings + action_embeddings
+        seq_embeddings += self.positional_embedding[:, :T, :]
 
         # Forward through encoder
-        encoder_output = self.encoder(seq_embeddings, mask=causal_mask)  # [B, T, embed_dim]
-
+        encoder_output = self.encoder(seq_embeddings)
+        
         # Apply Vector Quantizer
-        quantized, vq_loss, encoding_indices = self.vq(encoder_output)  # Quantized embeddings for decoder
+        quantized, vq_loss, encoding_indices = self.vq(encoder_output)
 
-        # Prepare target input for the decoder
+        predicted_frames = []
+        decoder_inputs = torch.zeros((B, T, self.embed_dim), device=states.device)
+
         if target_states is not None:
-            # Teacher forcing: use shifted target frames
+            # Training mode with teacher forcing
             target_embeddings = self.state_encoder(target_states.view(-1, C, H, W))
-            target_embeddings = target_embeddings.view(B, T, -1)  # [B, T, embed_dim]
-            target_embeddings = target_embeddings[:, :-1, :]  # Shift by one time step
-            target_embeddings = target_embeddings + self.positional_embedding[:, :target_embeddings.size(1), :]
+            target_embeddings = target_embeddings.view(B, T, -1)
 
-            # Causal mask for the decoder
-            tgt_mask = self.generate_causal_mask(target_embeddings.size(1), states.device)
+            for t in range(T - 1):
+                # if t == 0 or torch.rand(1).item() > sampling_probability:
+                decoder_inputs[:, t, :] = target_embeddings[:, t, :]
+                # else:
+                #     prev_embedding = self.state_encoder(prev_output.view(-1, C, H, W))
+                #     decoder_inputs[:, t, :] = prev_embedding
 
-            # Decoder forward pass
-            outputs = self.decoder(target_embeddings, quantized, tgt_mask=tgt_mask)  # [B, T-1, embed_dim]
+                # Add positional embeddings
+                curr_decoder_input = decoder_inputs[:, :t+1, :] + self.positional_embedding[:, :t+1, :]
+                
+                # Forward through decoder
+                output = self.decoder(
+                    curr_decoder_input,
+                    quantized[:, :t+1, :],
+                    tgt_mask=self.generate_causal_mask(t+1, states.device)
+                )
+
+                # Reconstruct frame from the last output
+                prev_output = self.reconstruct(output[:, -1])
+                predicted_frames.append(prev_output)
+
         else:
-            # During inference, autoregressively predict frames
-            outputs = quantized
+            # Inference mode
+            for t in range(T - 1):
+                if t == 0:
+                    decoder_inputs[:, 0, :] = state_embeddings[:, 0, :]
+                else:
+                    prev_embedding = self.state_encoder(prev_output.view(-1, C, H, W))
+                    decoder_inputs[:, t, :] = prev_embedding
 
-        # Reconstruct frames from Transformer output embeddings
-        frame_embeddings = outputs  # [B, T-1, embed_dim] (or [B, T, embed_dim] during inference)
-        predicted_frames = self.reconstruct(frame_embeddings.reshape(-1, self.embed_dim))  # [B*(T-1), 1, H, W]
-        predicted_frames = predicted_frames.view(B, -1, C, H, W)  # [B, T-1, 1, H, W]
+                # Add positional embeddings
+                curr_decoder_input = decoder_inputs[:, :t+1, :] + self.positional_embedding[:, :t+1, :]
+                
+                # Forward through decoder
+                output = self.decoder(
+                    curr_decoder_input,
+                    quantized[:, :t+1, :],
+                    tgt_mask=self.generate_causal_mask(t+1, states.device)
+                )
 
+                # Reconstruct frame from the last output
+                prev_output = self.reconstruct(output[:, -1])
+                predicted_frames.append(prev_output)
+
+        predicted_frames = torch.stack(predicted_frames, dim=1)
         return predicted_frames, vq_loss, encoding_indices
+
 
 
 def save_frames(states, predicted_frames, epoch, batch_idx, max_examples=5, max_frames=30, folder_prefix="frames"):
@@ -1052,13 +651,13 @@ def save_model_checkpoint(model, epoch, save_dir="checkpoints"):
 
 
 
-def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_step_size=50, scheduler_gamma=0.9, save_interval=5):
+def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_step_size=50, scheduler_gamma=0.9, save_interval=5, collate_fn=None):
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
     # DataLoader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     # Loss function and optimizer
     criterion = nn.MSELoss()
@@ -1101,7 +700,11 @@ def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_st
 
             # Logging loss for each batch
             if indices is not None:
-                print(f"Epoch [{epoch + 1}/{epochs}], Batch [{batch_idx + 1}/{len(dataloader)}], Recon Loss: {reconstruction_loss.item():.4f}, VQ Loss: {vq_loss.item()}, Unique Indices: {torch.unique(indices)} ")
+                print(f"Epoch [{epoch + 1}/{epochs}], Batch [{batch_idx + 1}/{len(dataloader)}], Recon Loss: {reconstruction_loss.item():.4f}, VQ Loss: {vq_loss.item()}, Unique Indices: {len(torch.unique(indices))} ")
+                metrics = model.vq.get_codebook_metrics()
+                print(f"Active codes: {metrics['active_codes']}")
+                print(f"Codebook entropy: {metrics['codebook_entropy']:.2f}")
+                print(f"Average similarity: {metrics['avg_similarity']:.3f}")
             else:
                 print(f"Epoch [{epoch + 1}/{epochs}], Batch [{batch_idx + 1}/{len(dataloader)}],  Recon Loss: {reconstruction_loss.item():.4f}, VQ Loss: {vq_loss.item}")
 
@@ -1118,19 +721,19 @@ def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_st
                     "avg_similarity": metrics["avg_similarity"]
                     })
 
-            if batch_idx % 100 == 0:
-                metrics = model.vq.get_codebook_metrics()
-                print(f"Active codes: {metrics['active_codes']}")
-                print(f"Codebook entropy: {metrics['codebook_entropy']:.2f}")
-                print(f"Average similarity: {metrics['avg_similarity']:.3f}")
+            # if batch_idx % 100 == 0:
+            #     metrics = model.vq.get_codebook_metrics()
+            #     print(f"Active codes: {metrics['active_codes']}")
+            #     print(f"Codebook entropy: {metrics['codebook_entropy']:.2f}")
+            #     print(f"Average similarity: {metrics['avg_similarity']:.3f}")
             
 
         # Average epoch loss
         avg_epoch_loss = epoch_loss / len(dataloader)
         print(f"Epoch [{epoch + 1}/{epochs}], Average Loss: {avg_epoch_loss:.4f}")
         
-        if epoch % 5 == 0:
-            save_frames(states, predicted_frames, epoch, batch_idx, folder_prefix=f"frames_{generate_run_name(args)}")
+        # if epoch % 5 == 0:
+        #     save_frames(states, predicted_frames, epoch, batch_idx, folder_prefix=f"frames_{generate_run_name(args)}")
 
         # Scheduler step
         scheduler.step()
@@ -1144,47 +747,68 @@ def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_st
 
 
 
+# embed_dim = 32
+# num_heads = 4
+# num_layers = 2
+# action_dim = 6  
+# num_embeddings = 32
+# max_seq_len = 30
 
-model = AtariSeq2SeqTransformerVQ(
-    img_size=(84, 84),
-    # patch_size=4,
-    embed_dim=args.embed_dim,
-    num_heads=args.nhead,
-    num_layers=args.num_layers,
-    action_dim=18,
-    num_embeddings=args.num_embeddings,
-    max_seq_len=args.max_seq_len,
-).to("cuda")
-
-
-if args.load_checkpoint is not None:
-    model.load_state_dict(torch.load(args.load_checkpoint))
-    print(f"Model loaded from {args.load_checkpoint}")
-
-
-
-dataset = AtariGrayscaleDataset( dataset_path='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10', max_seq_len=args.max_seq_len, frame_skip=args.frame_skip)
-print(f"Dataset loaded with {len(dataset)} sequences.")
-
-# Define training parameters
-epochs = args.epochs
-learning_rate = args.learning_rate
-batch_size = args.batch_size
-scheduler_step_size = args.scheduler_step_size
-scheduler_gamma = 0.9
-train_model(model, dataset, epochs=epochs, batch_size=batch_size, lr=learning_rate, scheduler_step_size=scheduler_step_size, scheduler_gamma=scheduler_gamma)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# # Initialize the model
+# model = MiniGridSeq2SeqTransformerVQ(
+#     embed_dim=embed_dim,
+#     num_heads=num_heads,
+#     num_layers=num_layers,
+#     action_dim=action_dim,
+#     num_embeddings=num_embeddings,
+#     max_seq_len=max_seq_len
+# ).to("cuda")
 
 
+# dataset = MiniGridDataset('minigrid-fourrooms-v0')
+# train_model(model, dataset, epochs=2000, batch_size=32, lr=1e-4, scheduler_step_size=50, scheduler_gamma=0.9, save_interval=50, collate_fn=collate_fn)
 
-dataset = AtariGrayscaleDataset(dataset_path='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10', max_seq_len=60, frame_skip=args.frame_skip)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-analyzer = BehaviorAnalyzer(model, device)
-codes, transitions = analyzer.extract_behaviors(dataloader, num_samples=1000)
-print(f"Extracted {len(codes)} behavior codes and {len(transitions)} transitions.")
-transition_matrix = analyzer.analyze_transitions(transitions)
-print("Transition matrix calculated.")
-analyzer.visualize_behaviors(codes, save_path="behavior_embeddings.png")
-print("Behavior embeddings visualization saved as 'behavior_embeddings.png'.")
-analyzer.visualize_transitions(transition_matrix, save_path="transition_matrix.png")
-print("Transition matrix visualization saved as 'transition_matrix.png'.")
+
+# model = AtariSeq2SeqTransformerVQ(
+#     img_size=(84, 84),
+#     # patch_size=4,
+#     embed_dim=args.embed_dim,
+#     num_heads=args.nhead,
+#     num_layers=args.num_layers,
+#     action_dim=18,
+#     num_embeddings=args.num_embeddings,
+#     max_seq_len=args.max_seq_len,
+# ).to("cuda")
+
+
+# if args.load_checkpoint is not None:
+#     model.load_state_dict(torch.load(args.load_checkpoint))
+#     print(f"Model loaded from {args.load_checkpoint}")
+
+
+
+# dataset = AtariGrayscaleDataset( dataset_path='/home/ubuntu/.d4rl/datasets/Seaquest/1/1', max_seq_len=args.max_seq_len, frame_skip=args.frame_skip)
+# print(f"Dataset loaded with {len(dataset)} sequences.")
+
+# # Define training parameters
+# epochs = args.epochs
+# learning_rate = args.learning_rate
+# batch_size = args.batch_size
+# scheduler_step_size = args.scheduler_step_size
+# scheduler_gamma = 0.9
+# train_model(model, dataset, epochs=epochs, batch_size=batch_size, lr=learning_rate, scheduler_step_size=scheduler_step_size, scheduler_gamma=scheduler_gamma)
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+# dataset = AtariGrayscaleDataset(dataset_path='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10', max_seq_len=60, frame_skip=args.frame_skip)
+# dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+# analyzer = BehaviorAnalyzer(model, device)
+# codes, transitions = analyzer.extract_behaviors(dataloader, num_samples=1000)
+# print(f"Extracted {len(codes)} behavior codes and {len(transitions)} transitions.")
+# transition_matrix = analyzer.analyze_transitions(transitions)
+# print("Transition matrix calculated.")
+# analyzer.visualize_behaviors(codes, save_path="behavior_embeddings.png")
+# print("Behavior embeddings visualization saved as 'behavior_embeddings.png'.")
+# analyzer.visualize_transitions(transition_matrix, save_path="transition_matrix.png")
+# print("Transition matrix visualization saved as 'transition_matrix.png'.")
