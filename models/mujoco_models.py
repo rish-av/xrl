@@ -117,7 +117,7 @@ class VectorQuantizer(nn.Module):
                 perplexity, selected_cosine_sim, avg_euclidean, min_euclidean)
 
 
-class VQVAE_TeacherForcing(nn.Module):
+class Seq2SeqMujocoTransformer(nn.Module):
     def __init__(self, state_dim, action_dim, latent_dim, num_tokens, hidden_size, n_layers, n_heads, context_len, beta,
                  temp_init=1.0, temp_min=0.1, anneal_rate=0.00003, ema_decay=0.99):
         super().__init__()

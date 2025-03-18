@@ -66,7 +66,7 @@ def get_atari_args():
     parser.add_argument('--frame_skip', type=int, default=4, help="Number of frames to skip in dataset")
     parser.add_argument('--save_frames', action='store_true', help="Save frames")
     parser.add_argument('--save_frame_freq', type=int, default=1000, help="Frequency to save frames")
-    parser.add_argument('--dataset_path', type=str, default='/home/rishav/scratch/d4rl_dataset/Seaquest/1/10', help="Path to dataset")
+    parser.add_argument('--dataset_path', type=str, required=True, help="Path to dataset")
     parser.add_argument('--dataset_type', type=str, default='overlapping', help="Dataset type (non-overlapping or grayscale)")
     return parser.parse_args()
 
