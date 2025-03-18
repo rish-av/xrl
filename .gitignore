@@ -1,16 +1,3 @@
-*.pth
-__pycache__/
 d4rl
-*mp4
-*png
-*sh
 wandb/
 out/
-video*/
-visual*/
-weight*/
-*pkl
-images*/
-junk
-*png
-*pt
