@@ -307,7 +307,20 @@ class MLPPolicy(nn.Module):
     def forward(self, state):
         return self.net(state)
 
+
 class BCDataset(Dataset):
+    def __init__(self, states, actions):
+        self.states = torch.FloatTensor(states)
+        self.actions = torch.FloatTensor(actions)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
+
+
+class BCDatasetSegment(Dataset):
     def __init__(self, segments):
         self.states = []
         self.actions = []
@@ -328,9 +341,8 @@ class BCDataset(Dataset):
 
 def train_bc_with_eval(data_dict, epochs=50, batch_size=256, lr=3e-4, hidden_dim=256, train_split=0.9):
     policy_dict = {}
-
     for key, segments in data_dict.items():
-        dataset = BCDataset(segments)
+        dataset = BCDatasetSegment(segments)
         total_size = len(dataset)
         train_size = int(train_split * total_size)
         test_size = total_size - train_size
@@ -384,4 +396,31 @@ def train_bc_with_eval(data_dict, epochs=50, batch_size=256, lr=3e-4, hidden_dim
 
     return policy_dict
 
+#train bc on entire dataset
+def train_full_bc(dataset, epochs=50, batch_size=256, lr=3e-4, hidden_dim=256):
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    state_dim = dataset.states.shape[1]
+    action_dim = dataset.actions.shape[1]
 
+    policy = MLPPolicy(state_dim, action_dim, hidden_dim)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    for epoch in range(epochs):
+        policy.train()
+        total_train_loss = 0
+        for states, actions in train_loader:
+            pred_actions = policy(states)
+            loss = criterion(pred_actions, actions)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+
+        avg_train_loss = total_train_loss / len(train_loader)
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
+
+    return policy

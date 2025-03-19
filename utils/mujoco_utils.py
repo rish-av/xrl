@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import d4rl
 import gym
+from spectral_graph import SpectralGraphPartitioner
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -87,6 +88,16 @@ def load_d4rl_data(env_name):
     return states, actions
 
 
+
+
+def get_segmented_data(model, dataset, batch_size=128):
+    # return a dict based on the cluster
+    # {'1': [[segment1], [segment2]...]], '2': [[segment1], [segment2]...], ...}
+    segmented_data = {}
+    graph = SpectralGraphPartitioner(alpha=0.6)
+
+    #get codes for all state action pairs
+    return segmented_data
 
 
 

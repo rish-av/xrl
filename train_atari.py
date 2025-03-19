@@ -4,9 +4,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import wandb
 from utils.general_utils import save_model_checkpoint, generate_run_name
-from utils.atari_utils import get_atari_args, AtariGrayscaleDataset, save_frames_atari, get_sequence_codes
+from utils.atari_utils import get_atari_args, AtariGrayscaleDataset, get_sequence_codes
 from models.atari_models import AtariSeq2SeqTransformerVQ
 from spectral_graph import SpectralGraphPartitioner
+
+#NOTE: to train atari; you must download the dataset from d4rl and save it in the data folder, once saved, you need to pass it to the datapath argument.
 
 def train_model(model, dataset, epochs=2000, batch_size=4, lr=1e-4, scheduler_step_size=50, scheduler_gamma=0.9, save_interval=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,6 +119,7 @@ if __name__ == "__main__":
     scheduler_step_size = args.scheduler_step_size
     scheduler_gamma = 0.9
     train_model(model, dataset, epochs=epochs, batch_size=batch_size, lr=learning_rate, scheduler_step_size=scheduler_step_size, scheduler_gamma=scheduler_gamma)
+    
     #once trained build the graph
     with torch.no_grad():
         model.eval()
